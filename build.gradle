@@ -1,0 +1,64 @@
+plugins {
+    id "net.minecraftforge.gradle" version "[6.0,6.2)"
+    id "maven-publish"
+}
+
+version = "0.1.0"
+group = "team.xenobyte"
+
+base {
+    archivesName = "xenobyte-modern"
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:1.20.1-47.4.0"
+}
+
+minecraft {
+    mappings channel: "official", version: "1.20.1"
+    copyIdeResources = true
+
+    runs {
+        client {
+            workingDirectory project.file("run")
+            property "forge.logging.markers", "REGISTRIES"
+            property "forge.logging.console.level", "debug"
+            mods {
+                xenobyte_modern {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+sourceSets {
+    main {
+        java.srcDirs = ["src/client/java"]
+        resources.srcDirs = ["src/client/resources"]
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = "UTF-8"
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("META-INF/mods.toml") {
+        expand([
+            "version": project.version,
+            "minecraft_version": "1.20.1",
+            "forge_version": "47.4.0"
+        ])
+    }
+}

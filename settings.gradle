@@ -1,0 +1,22 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = "MinecraftForge"
+            url = "https://maven.minecraftforge.net/"
+        }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        maven {
+            name = "MinecraftForge"
+            url = "https://maven.minecraftforge.net/"
+        }
+        mavenCentral()
+    }
+}
+
+rootProject.name = "xenobyte-modern-forge"

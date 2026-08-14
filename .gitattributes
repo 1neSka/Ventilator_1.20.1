@@ -1,0 +1,17 @@
+* text=auto
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.java text eol=lf
+*.gradle text eol=lf
+*.properties text eol=lf
+*.cpp text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+gradlew text eol=lf
+
+*.jar binary
+*.wav binary
+*.ogg binary

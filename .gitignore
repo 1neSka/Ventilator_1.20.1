@@ -1,0 +1,47 @@
+# Gradle caches and generated outputs
+.gradle/
+build/
+out/
+run/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local environment and machine-specific overrides
+.env
+.env.*
+!.env.example
+local.properties
+*.local
+*.local.*
+
+# Credentials and signing material
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.*
+secrets.*
+
+# Native build products and packaged hotfix history
+native_loader/build/
+native_loader/build_hotfix*/
+native_loader/old_builds/
+native_loader/*.obj
+native_loader/*.pdb
+native_loader/*.exp
+native_loader/*.lib
+native_loader/*.dll
+
+# Runtime diagnostics
+*.log
+hs_err_pid*
+replay_pid*
+xenobyte-*-log-*.txt
+last_runtime_report.txt
