@@ -59,6 +59,8 @@ public class RecipeGraphModule extends XenoModule {
         .describe("Compact keeps one-line definitions. Full includes recipe type, serializer and complete choices."));
     private final ModuleSetting alternatives = setting("Alternatives", ModuleSetting.choice("Alternatives", 0, "Summary", "Full", "Off")
         .describe("Summary only reports counts. Full appends every available recipe."));
+    private final ModuleSetting noiseFilter = setting("NoiseFilter", ModuleSetting.bool("NoiseFilter", true)
+        .describe("Stops reversible packing loops and one-step transmutation chains from polluting the graph."));
 
     private Path lastExport;
     private String lastResult = "never";
@@ -125,18 +127,21 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private ExportContext createContext(Minecraft client) {
-        Map<Item, List<Recipe<?>>> recipesByOutput = new HashMap<>();
+        Map<Item, List<RecipeEntry>> recipesByOutput = new HashMap<>();
         List<String> indexingErrors = new ArrayList<>();
+        Set<String> indexedKeys = new HashSet<>();
+        Set<String> managedRecipeIds = new HashSet<>();
         int recipeCount = 0;
 
         for (Recipe<?> recipe : client.level.getRecipeManager().getRecipes()) {
             recipeCount++;
+            managedRecipeIds.add(safeRecipeId(recipe));
             try {
-                ItemStack result = recipe.getResultItem(client.level.registryAccess());
-                if (result == null || result.isEmpty() || result.getItem() == Items.AIR) {
+                RecipeEntry entry = vanillaEntry(client, recipe);
+                if (entry == null) {
                     continue;
                 }
-                recipesByOutput.computeIfAbsent(result.getItem(), ignored -> new ArrayList<>()).add(recipe);
+                addRecipe(recipesByOutput, indexedKeys, entry);
             } catch (RuntimeException | LinkageError error) {
                 if (indexingErrors.size() < 64) {
                     indexingErrors.add(safeRecipeId(recipe) + " -> " + error.getClass().getSimpleName()
@@ -145,10 +150,68 @@ public class RecipeGraphModule extends XenoModule {
             }
         }
 
-        Comparator<Recipe<?>> byId = Comparator.comparing(this::safeRecipeId);
+        JeiRecipeBridge.ScanResult jeiScan = JeiRecipeBridge.scan(managedRecipeIds);
+        for (JeiRecipeBridge.RecipeData data : jeiScan.recipes()) {
+            RecipeEntry entry = new RecipeEntry(data.id(), data.station(), "jei:" + data.type(),
+                "jei:runtime", data.output().copy(), copyGroups(data.inputs()), true, data.partial());
+            addRecipe(recipesByOutput, indexedKeys, entry);
+        }
+
+        Comparator<RecipeEntry> byId = Comparator.comparing(RecipeEntry::id);
         recipesByOutput.values().forEach(recipes -> recipes.sort(byId));
         return new ExportContext(client, recipesByOutput, recipeCount, indexingErrors,
-            maxDepth.intValue(), leafMode.choiceValue(), detail.choiceValue(), alternatives.choiceValue());
+            maxDepth.intValue(), leafMode.choiceValue(), detail.choiceValue(), alternatives.choiceValue(),
+            noiseFilter.boolValue(), jeiScan);
+    }
+
+    private RecipeEntry vanillaEntry(Minecraft client, Recipe<?> recipe) {
+        ItemStack result = recipe.getResultItem(client.level.registryAccess());
+        if (result == null || result.isEmpty() || result.getItem() == Items.AIR) {
+            return null;
+        }
+        List<List<ItemStack>> groups = new ArrayList<>();
+        for (Ingredient ingredient : recipe.getIngredients()) {
+            if (ingredient == null || ingredient.isEmpty()) {
+                continue;
+            }
+            List<ItemStack> options = new ArrayList<>();
+            for (ItemStack stack : ingredient.getItems()) {
+                if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
+                    options.add(stack.copy());
+                }
+            }
+            if (!options.isEmpty()) {
+                groups.add(List.copyOf(options));
+            }
+        }
+        return new RecipeEntry(safeRecipeId(recipe), stationName(recipe), recipeTypeId(recipe),
+            recipeSerializerId(recipe), result.copy(), List.copyOf(groups), false, false);
+    }
+
+    private void addRecipe(Map<Item, List<RecipeEntry>> recipesByOutput, Set<String> indexedKeys,
+                           RecipeEntry entry) {
+        ResourceLocation outputId = itemKey(entry.result.getItem());
+        String key = outputId + "|" + entry.type + "|" + entry.id;
+        if (!indexedKeys.add(key)) {
+            return;
+        }
+        recipesByOutput.computeIfAbsent(entry.result.getItem(), ignored -> new ArrayList<>()).add(entry);
+    }
+
+    private List<List<ItemStack>> copyGroups(List<List<ItemStack>> groups) {
+        List<List<ItemStack>> copy = new ArrayList<>();
+        for (List<ItemStack> group : groups) {
+            List<ItemStack> options = new ArrayList<>();
+            for (ItemStack stack : group) {
+                if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
+                    options.add(stack.copy());
+                }
+            }
+            if (!options.isEmpty()) {
+                copy.add(List.copyOf(options));
+            }
+        }
+        return List.copyOf(copy);
     }
 
     private void appendHeader(StringBuilder output, Minecraft client, ExportContext context, Item target, long requested) {
@@ -164,7 +227,9 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Maximum depth: ").append(context.maxDepth).append(System.lineSeparator());
         output.append("Detail: ").append(context.detailMode).append(System.lineSeparator());
         output.append("Alternatives: ").append(context.alternativesMode).append(System.lineSeparator());
+        output.append("Noise filter: ").append(context.noiseFilter ? "ON" : "OFF").append(System.lineSeparator());
         output.append("Indexed recipes: ").append(context.recipeCount).append(System.lineSeparator());
+        output.append("JEI-only recipes: ").append(context.jeiScan.recipes().size()).append(System.lineSeparator());
         output.append(System.lineSeparator());
         output.append("Selection rules:").append(System.lineSeparator());
         output.append("- Recipes are scored before their ID is used as a deterministic tie breaker.").append(System.lineSeparator());
@@ -172,7 +237,7 @@ public class RecipeGraphModule extends XenoModule {
             .append(System.lineSeparator());
         output.append("- Ingredient alternatives prefer common raw items, vanilla base items and simple variants.")
             .append(System.lineSeparator());
-        output.append("- Only recipes exposed by the synchronized Minecraft RecipeManager are available.")
+        output.append("- Recipes exposed only through JEI are merged with synchronized RecipeManager recipes.")
             .append(System.lineSeparator());
     }
 
@@ -219,7 +284,7 @@ public class RecipeGraphModule extends XenoModule {
             return;
         }
 
-        List<Recipe<?>> recipes = context.recipesByOutput.getOrDefault(item, List.of());
+        List<RecipeEntry> recipes = context.recipesByOutput.getOrDefault(item, List.of());
         if (recipes.isEmpty()) {
             registerLeaf(context, item, "NO RECIPE");
             recordRaw(context, item, required);
@@ -230,10 +295,16 @@ public class RecipeGraphModule extends XenoModule {
 
         RecipePlan recipePlan = selectedPlan(context, item, recipes);
         if (recipePlan == null || recipePlan.result.isEmpty() || recipePlan.ingredients.isEmpty()) {
-            registerLeaf(context, item, "UNSUPPORTED/EMPTY RECIPE");
+            String reason = context.noiseFilteredOutputs.contains(item)
+                ? "FILTERED CONVERSION" : "UNSUPPORTED/EMPTY RECIPE";
+            registerLeaf(context, item, reason);
             recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "UNSUPPORTED/EMPTY RECIPE");
-            context.unsupportedStops++;
+            if (emit) appendPlanLeaf(output, id, item, required, depth, reason);
+            if (context.noiseFilteredOutputs.contains(item)) {
+                context.filteredStops++;
+            } else {
+                context.unsupportedStops++;
+            }
             return;
         }
 
@@ -241,7 +312,7 @@ public class RecipeGraphModule extends XenoModule {
         int outputCount = Math.max(1, recipePlan.result.getCount());
         long crafts = ceilDiv(required, outputCount);
         if (emit) {
-            appendPlanRecipe(output, id, item, required, depth, stationName(recipePlan.recipe), crafts);
+            appendPlanRecipe(output, id, item, required, depth, recipePlan.recipe.station, crafts);
         }
 
         Set<Item> nextAncestors = new LinkedHashSet<>(ancestors);
@@ -252,7 +323,7 @@ public class RecipeGraphModule extends XenoModule {
         }
     }
 
-    private RecipePlan selectedPlan(ExportContext context, Item item, List<Recipe<?>> recipes) {
+    private RecipePlan selectedPlan(ExportContext context, Item item, List<RecipeEntry> recipes) {
         if (context.selectedPlans.containsKey(item)) {
             return context.selectedPlans.get(item);
         }
@@ -264,15 +335,20 @@ public class RecipeGraphModule extends XenoModule {
         return selected;
     }
 
-    private RecipePlan selectRecipe(ExportContext context, Item output, List<Recipe<?>> recipes) {
+    private RecipePlan selectRecipe(ExportContext context, Item output, List<RecipeEntry> recipes) {
         RecipePlan best = null;
         long bestScore = Long.MAX_VALUE;
         Set<Item> blockedIngredients = Set.of(output);
-        for (Recipe<?> recipe : recipes) {
+        int filtered = 0;
+        for (RecipeEntry recipe : recipes) {
             try {
-                ItemStack result = recipe.getResultItem(context.client.level.registryAccess());
                 List<IngredientPlan> ingredients = planIngredients(context, recipe, blockedIngredients, output);
-                RecipePlan candidate = new RecipePlan(recipe, result.copy(), ingredients);
+                if (context.noiseFilter && isObviousNoise(context, output, recipe, ingredients)) {
+                    filtered++;
+                    context.filteredRecipes++;
+                    continue;
+                }
+                RecipePlan candidate = new RecipePlan(recipe, recipe.result.copy(), ingredients);
                 long score = recipeScore(context, output, candidate);
                 if (best == null || score < bestScore) {
                     best = candidate;
@@ -280,12 +356,30 @@ public class RecipeGraphModule extends XenoModule {
                 }
             } catch (RuntimeException | LinkageError error) {
                 if (context.expansionErrors.size() < 64) {
-                    context.expansionErrors.add(safeRecipeId(recipe) + " -> " + error.getClass().getSimpleName()
+                    context.expansionErrors.add(recipe.id + " -> " + error.getClass().getSimpleName()
                         + ": " + clean(error.getMessage()));
                 }
             }
         }
+        if (best == null && filtered > 0) {
+            context.noiseFilteredOutputs.add(output);
+        }
         return best;
+    }
+
+    private boolean isObviousNoise(ExportContext context, Item output, RecipeEntry recipe,
+                                   List<IngredientPlan> ingredients) {
+        String id = recipe.id.toLowerCase(Locale.ROOT);
+        if (ingredients.size() == 1) {
+            if (id.contains("_to_") || id.contains("/to_") || id.contains("transmutation")) {
+                return true;
+            }
+            if (reverseCyclePenalty(context, output, ingredients) > 0) {
+                return true;
+            }
+        }
+        return id.contains("deconstruction") || id.contains("deconstruct")
+            || id.contains("recycling") || id.contains("recycle");
     }
 
     private long recipeScore(ExportContext context, Item output, RecipePlan plan) {
@@ -310,9 +404,9 @@ public class RecipeGraphModule extends XenoModule {
         return score;
     }
 
-    private int recipeRoutePenalty(Recipe<?> recipe) {
-        String id = safeRecipeId(recipe).toLowerCase(Locale.ROOT);
-        String type = recipeTypeId(recipe).toLowerCase(Locale.ROOT);
+    private int recipeRoutePenalty(RecipeEntry recipe) {
+        String id = recipe.id.toLowerCase(Locale.ROOT);
+        String type = recipe.type.toLowerCase(Locale.ROOT);
         int penalty = 0;
         if (id.contains("deconstruction") || id.contains("deconstruct")) penalty += 2_000;
         if (id.contains("recycling") || id.contains("recycle")) penalty += 1_800;
@@ -331,7 +425,7 @@ public class RecipeGraphModule extends XenoModule {
             if (isCommonRaw(ingredient.item)) {
                 continue;
             }
-            for (Recipe<?> reverse : context.recipesByOutput.getOrDefault(ingredient.item, List.of())) {
+            for (RecipeEntry reverse : context.recipesByOutput.getOrDefault(ingredient.item, List.of())) {
                 if (recipeContainsItem(context, reverse, output)) {
                     penalty++;
                     break;
@@ -341,37 +435,22 @@ public class RecipeGraphModule extends XenoModule {
         return penalty;
     }
 
-    private boolean recipeContainsItem(ExportContext context, Recipe<?> recipe, Item item) {
-        Set<Item> cached = context.recipeInputs.get(recipe);
-        if (cached == null) {
-            cached = new HashSet<>();
-            try {
-                for (Ingredient ingredient : recipe.getIngredients()) {
-                    if (ingredient == null || ingredient.isEmpty()) {
-                        continue;
-                    }
-                    for (ItemStack stack : ingredient.getItems()) {
-                        if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
-                            cached.add(stack.getItem());
-                        }
-                    }
+    private boolean recipeContainsItem(ExportContext context, RecipeEntry recipe, Item item) {
+        for (List<ItemStack> group : recipe.inputGroups) {
+            for (ItemStack stack : group) {
+                if (stack.getItem() == item) {
+                    return true;
                 }
-            } catch (RuntimeException | LinkageError ignored) {
-                // An unreadable custom recipe is not useful for cycle scoring.
             }
-            context.recipeInputs.put(recipe, cached);
         }
-        return cached.contains(item);
+        return false;
     }
 
-    private List<IngredientPlan> planIngredients(ExportContext context, Recipe<?> recipe, Set<Item> blocked, Item output) {
+    private List<IngredientPlan> planIngredients(ExportContext context, RecipeEntry recipe, Set<Item> blocked, Item output) {
         Map<Item, MutableIngredientPlan> grouped = new LinkedHashMap<>();
-        for (Ingredient ingredient : recipe.getIngredients()) {
-            if (ingredient == null || ingredient.isEmpty()) {
-                continue;
-            }
+        for (List<ItemStack> group : recipe.inputGroups) {
             List<ItemStack> options = new ArrayList<>();
-            for (ItemStack stack : ingredient.getItems()) {
+            for (ItemStack stack : group) {
                 if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
                     options.add(stack.copy());
                 }
@@ -483,11 +562,25 @@ public class RecipeGraphModule extends XenoModule {
             }
 
             RecipePlan plan = definition.plan;
-            output.append("  via: ").append(stationName(plan.recipe)).append(" | ").append(safeRecipeId(plan.recipe))
-                .append(" | output x").append(Math.max(1, plan.result.getCount())).append(System.lineSeparator());
+            output.append("  via: ").append(plan.recipe.station).append(" | ").append(plan.recipe.id)
+                .append(" | output x").append(Math.max(1, plan.result.getCount()));
+            if (plan.recipe.jeiOnly) {
+                output.append(" | JEI");
+            }
+            if (plan.recipe.partial) {
+                output.append(" | PARTIAL");
+            }
+            output.append(System.lineSeparator());
             if ("Full".equals(context.detailMode)) {
-                output.append("  type: ").append(recipeTypeId(plan.recipe))
-                    .append(" | serializer: ").append(recipeSerializerId(plan.recipe)).append(System.lineSeparator());
+                output.append("  type: ").append(plan.recipe.type)
+                    .append(" | serializer: ").append(plan.recipe.serializer).append(System.lineSeparator());
+                if (plan.recipe.jeiOnly) {
+                    output.append("  source: JEI-only");
+                    if (plan.recipe.partial) {
+                        output.append(" (non-item inputs omitted)");
+                    }
+                    output.append(System.lineSeparator());
+                }
             }
             if (plan.ingredients.isEmpty()) {
                 output.append("  inputs: not exposed").append(System.lineSeparator());
@@ -518,26 +611,21 @@ public class RecipeGraphModule extends XenoModule {
         }
     }
 
-    private void appendFullAlternatives(ExportContext context, Item item, Recipe<?> selected, List<Recipe<?>> recipes) {
+    private void appendFullAlternatives(ExportContext context, Item item, RecipeEntry selected,
+                                        List<RecipeEntry> recipes) {
         context.fullAlternatives.append(System.lineSeparator()).append(itemLabel(item)).append(System.lineSeparator());
         int shown = 0;
-        for (Recipe<?> recipe : recipes) {
+        for (RecipeEntry recipe : recipes) {
             if (shown++ >= MAX_RECIPE_ALTERNATIVES) {
                 context.fullAlternatives.append("  ... ").append(recipes.size() - MAX_RECIPE_ALTERNATIVES)
                     .append(" more recipe(s)").append(System.lineSeparator());
                 break;
             }
-            ItemStack result;
-            try {
-                result = recipe.getResultItem(context.client.level.registryAccess());
-            } catch (RuntimeException | LinkageError ignored) {
-                result = ItemStack.EMPTY;
-            }
             context.fullAlternatives.append(recipe == selected ? "  * SELECTED " : "  - ")
-                .append(safeRecipeId(recipe)).append(System.lineSeparator());
-            context.fullAlternatives.append("      via: ").append(stationName(recipe))
-                .append(" | type: ").append(recipeTypeId(recipe))
-                .append(" | output: ").append(result.isEmpty() ? "unknown" : result.getCount())
+                .append(recipe.id).append(System.lineSeparator());
+            context.fullAlternatives.append("      via: ").append(recipe.station)
+                .append(" | type: ").append(recipe.type)
+                .append(" | output: ").append(recipe.result.isEmpty() ? "unknown" : recipe.result.getCount())
                 .append(System.lineSeparator());
             context.fullAlternatives.append("      inputs: ").append(recipeInputSummary(recipe)).append(System.lineSeparator());
         }
@@ -576,6 +664,8 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Unique item definitions: ").append(context.definitions.size()).append(System.lineSeparator());
         output.append("Collapsed references: ").append(context.collapsedReferences).append(System.lineSeparator());
         output.append("Recipe choices changed by scoring: ").append(context.scoredRecipeChanges).append(System.lineSeparator());
+        output.append("Noise-filtered recipes: ").append(context.filteredRecipes).append(System.lineSeparator());
+        output.append("Noise-filtered terminal items: ").append(context.filteredStops).append(System.lineSeparator());
         output.append("Common raw stops: ").append(context.commonStops).append(System.lineSeparator());
         output.append("No recipe stops: ").append(context.noRecipeStops).append(System.lineSeparator());
         output.append("Maximum depth stops: ").append(context.depthStops).append(System.lineSeparator());
@@ -584,8 +674,16 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Node limit stops: ").append(context.nodeLimitStops).append(System.lineSeparator());
         output.append("Ingredient choices: ").append(context.ingredientChoices).append(System.lineSeparator());
         output.append("Alternative recipe groups: ").append(context.alternativeGroups).append(System.lineSeparator());
+        output.append("JEI categories scanned: ").append(context.jeiScan.categories()).append(System.lineSeparator());
+        output.append("JEI recipes inspected: ").append(context.jeiScan.inspectedRecipes()).append(System.lineSeparator());
+        output.append("JEI RecipeManager duplicates skipped: ").append(context.jeiScan.skippedVanillaRecipes())
+            .append(System.lineSeparator());
+        output.append("JEI-only recipes indexed: ").append(context.jeiScan.recipes().size()).append(System.lineSeparator());
+        output.append("JEI partial recipes: ").append(context.jeiScan.partialRecipes()).append(System.lineSeparator());
+        output.append("JEI non-item slots: ").append(context.jeiScan.nonItemSlots()).append(System.lineSeparator());
         appendErrors(output, "Recipe indexing errors", context.indexingErrors);
         appendErrors(output, "Recipe expansion errors", context.expansionErrors);
+        appendErrors(output, "JEI bridge errors", context.jeiScan.errors());
     }
 
     private void appendErrors(StringBuilder output, String title, List<String> errors) {
@@ -595,27 +693,20 @@ public class RecipeGraphModule extends XenoModule {
         }
     }
 
-    private String recipeInputSummary(Recipe<?> recipe) {
+    private String recipeInputSummary(RecipeEntry recipe) {
         List<String> inputs = new ArrayList<>();
-        try {
-            for (Ingredient ingredient : recipe.getIngredients()) {
-                if (ingredient == null || ingredient.isEmpty()) {
-                    continue;
-                }
-                List<Item> options = new ArrayList<>();
-                int count = 1;
-                for (ItemStack stack : ingredient.getItems()) {
-                    if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
-                        options.add(stack.getItem());
-                        count = Math.max(count, stack.getCount());
-                    }
-                }
-                if (!options.isEmpty()) {
-                    inputs.add(formatItems(options, 5) + " x" + count);
+        for (List<ItemStack> group : recipe.inputGroups) {
+            List<Item> options = new ArrayList<>();
+            int count = 1;
+            for (ItemStack stack : group) {
+                if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
+                    options.add(stack.getItem());
+                    count = Math.max(count, stack.getCount());
                 }
             }
-        } catch (RuntimeException | LinkageError error) {
-            return "unavailable (" + error.getClass().getSimpleName() + ")";
+            if (!options.isEmpty()) {
+                inputs.add(formatItems(options, 5) + " x" + count);
+            }
         }
         return inputs.isEmpty() ? "not exposed" : String.join(" + ", inputs);
     }
@@ -813,10 +904,16 @@ public class RecipeGraphModule extends XenoModule {
             + " leaf=" + leafMode.choiceValue()
             + " depth=" + maxDepth.displayValue()
             + " detail=" + detail.choiceValue()
-            + " alternatives=" + alternatives.choiceValue();
+            + " alternatives=" + alternatives.choiceValue()
+            + " noiseFilter=" + noiseFilter.boolValue();
     }
 
-    private record RecipePlan(Recipe<?> recipe, ItemStack result, List<IngredientPlan> ingredients) {
+    private record RecipeEntry(String id, String station, String type, String serializer,
+                               ItemStack result, List<List<ItemStack>> inputGroups,
+                               boolean jeiOnly, boolean partial) {
+    }
+
+    private record RecipePlan(RecipeEntry recipe, ItemStack result, List<IngredientPlan> ingredients) {
     }
 
     private record IngredientPlan(Item item, long count, List<Item> alternatives) {
@@ -837,7 +934,7 @@ public class RecipeGraphModule extends XenoModule {
 
     private static final class ExportContext {
         private final Minecraft client;
-        private final Map<Item, List<Recipe<?>>> recipesByOutput;
+        private final Map<Item, List<RecipeEntry>> recipesByOutput;
         private final int recipeCount;
         private final List<String> indexingErrors;
         private final List<String> expansionErrors = new ArrayList<>();
@@ -845,17 +942,21 @@ public class RecipeGraphModule extends XenoModule {
         private final String leafMode;
         private final String detailMode;
         private final String alternativesMode;
+        private final boolean noiseFilter;
+        private final JeiRecipeBridge.ScanResult jeiScan;
         private final Map<Item, Long> rawTotals = new HashMap<>();
         private final Map<Item, Integer> nodeIds = new LinkedHashMap<>();
         private final Map<Item, RecipeDefinition> definitions = new LinkedHashMap<>();
         private final Map<Item, RecipePlan> selectedPlans = new HashMap<>();
-        private final Map<Recipe<?>, Set<Item>> recipeInputs = new HashMap<>();
         private final Set<Item> renderedItems = new HashSet<>();
         private final Set<Item> reportedAlternativeItems = new HashSet<>();
+        private final Set<Item> noiseFilteredOutputs = new HashSet<>();
         private final StringBuilder fullAlternatives = new StringBuilder();
         private int nodes;
         private int collapsedReferences;
         private int scoredRecipeChanges;
+        private int filteredRecipes;
+        private int filteredStops;
         private int commonStops;
         private int noRecipeStops;
         private int depthStops;
@@ -865,9 +966,10 @@ public class RecipeGraphModule extends XenoModule {
         private int ingredientChoices;
         private int alternativeGroups;
 
-        private ExportContext(Minecraft client, Map<Item, List<Recipe<?>>> recipesByOutput, int recipeCount,
+        private ExportContext(Minecraft client, Map<Item, List<RecipeEntry>> recipesByOutput, int recipeCount,
                               List<String> indexingErrors, int maxDepth, String leafMode,
-                              String detailMode, String alternativesMode) {
+                              String detailMode, String alternativesMode, boolean noiseFilter,
+                              JeiRecipeBridge.ScanResult jeiScan) {
             this.client = client;
             this.recipesByOutput = recipesByOutput;
             this.recipeCount = recipeCount;
@@ -876,6 +978,8 @@ public class RecipeGraphModule extends XenoModule {
             this.leafMode = leafMode;
             this.detailMode = detailMode;
             this.alternativesMode = alternativesMode;
+            this.noiseFilter = noiseFilter;
+            this.jeiScan = jeiScan;
         }
     }
 }
