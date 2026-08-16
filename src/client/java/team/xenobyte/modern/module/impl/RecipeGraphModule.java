@@ -40,11 +40,18 @@ public class RecipeGraphModule extends XenoModule {
     private static final int MAX_GRAPH_NODES = 8_000;
     private static final int MAX_ALTERNATIVES_PER_INGREDIENT = 12;
     private static final int MAX_RECIPE_ALTERNATIVES = 24;
+    private static final int COMPLEXITY_LOOKAHEAD = 3;
 
     private static final Set<String> COMMON_RAW_NAMES = Set.of(
         "redstone", "glowstone_dust", "diamond", "emerald", "coal", "charcoal",
         "lapis_lazuli", "quartz", "amethyst_shard", "flint", "clay_ball",
         "slime_ball", "ender_pearl", "nether_star", "echo_shard"
+    );
+    private static final Set<String> BASE_ELEMENT_NAMES = Set.of(
+        "iron", "gold", "copper", "tin", "lead", "silver", "nickel", "osmium",
+        "uranium", "zinc", "aluminum", "aluminium", "platinum", "iridium", "cobalt",
+        "tungsten", "titanium", "chromium", "chrome", "magnesium", "lithium",
+        "boron", "thorium"
     );
 
     private final ModuleSetting itemId = setting("ItemId", ModuleSetting.number("ItemId", 0.0D, 0.0D, 250000.0D, 1.0D)
@@ -52,9 +59,11 @@ public class RecipeGraphModule extends XenoModule {
     private final ModuleSetting amount = setting("Amount", ModuleSetting.number("Amount", 1.0D, 1.0D, 1_000_000.0D, 1.0D)
         .describe("Requested output amount."));
     private final ModuleSetting leafMode = setting("LeafMode", ModuleSetting.choice("LeafMode", 0, "Common", "NoRecipe")
-        .describe("Common stops at ingots, gems, dusts and ores. NoRecipe expands until a terminal recipe."));
+        .describe("Common uses Smart Raw for base materials. NoRecipe expands until a terminal recipe."));
     private final ModuleSetting maxDepth = setting("MaxDepth", ModuleSetting.number("MaxDepth", 16.0D, 1.0D, 48.0D, 1.0D)
         .describe("Maximum recursive recipe depth."));
+    private final ModuleSetting materialDepth = setting("MaterialDepth", ModuleSetting.number("MaterialDepth", 0.0D, 0.0D, 16.0D, 1.0D)
+        .describe("0 = automatic. Otherwise limits how many non-base material recipes expand along one branch."));
     private final ModuleSetting detail = setting("Detail", ModuleSetting.choice("Detail", 0, "Compact", "Full")
         .describe("Compact keeps one-line definitions. Full includes recipe type, serializer and complete choices."));
     private final ModuleSetting alternatives = setting("Alternatives", ModuleSetting.choice("Alternatives", 0, "Summary", "Full", "Off")
@@ -88,7 +97,7 @@ public class RecipeGraphModule extends XenoModule {
             ResourceLocation targetId = itemKey(target);
 
             StringBuilder plan = new StringBuilder(32_000);
-            expand(context, plan, target, requested, 0, new LinkedHashSet<>(), true);
+            expand(context, plan, target, requested, 0, 0, new LinkedHashSet<>(), true);
 
             StringBuilder output = new StringBuilder(48_000);
             appendHeader(output, client, context, target, requested);
@@ -163,7 +172,7 @@ public class RecipeGraphModule extends XenoModule {
         recipesByOutput.values().forEach(recipes -> recipes.sort(byId));
         return new ExportContext(client, recipesByOutput, recipeCount, indexingErrors,
             maxDepth.intValue(), leafMode.choiceValue(), detail.choiceValue(), alternatives.choiceValue(),
-            noiseFilter.boolValue(), jeiScan);
+            noiseFilter.boolValue(), materialDepth.intValue(), jeiScan);
     }
 
     private RecipeEntry vanillaEntry(Minecraft client, Recipe<?> recipe) {
@@ -227,6 +236,8 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Requested amount: ").append(requested).append(System.lineSeparator());
         output.append("Leaf mode: ").append(context.leafMode).append(System.lineSeparator());
         output.append("Maximum depth: ").append(context.maxDepth).append(System.lineSeparator());
+        output.append("Material depth: ").append(context.materialDepth == 0 ? "Auto" : context.materialDepth)
+            .append(System.lineSeparator());
         output.append("Detail: ").append(context.detailMode).append(System.lineSeparator());
         output.append("Alternatives: ").append(context.alternativesMode).append(System.lineSeparator());
         output.append("Noise filter: ").append(context.noiseFilter ? "ON" : "OFF").append(System.lineSeparator());
@@ -239,12 +250,16 @@ public class RecipeGraphModule extends XenoModule {
             .append(System.lineSeparator());
         output.append("- Ingredient alternatives prefer common raw items, vanilla base items and simple variants.")
             .append(System.lineSeparator());
+        output.append("- Common uses Smart Raw: elemental materials stop, while trusted mod processing chains expand.")
+            .append(System.lineSeparator());
+        output.append("- Quest, loot-fabrication and trading routes are fallback acquisition paths, not preferred crafting.")
+            .append(System.lineSeparator());
         output.append("- Recipes exposed only through JEI are merged with synchronized RecipeManager recipes.")
             .append(System.lineSeparator());
     }
 
     private void expand(ExportContext context, StringBuilder output, Item item, long required, int depth,
-                        Set<Item> ancestors, boolean emit) {
+                        int expandedMaterials, Set<Item> ancestors, boolean emit) {
         context.nodes++;
         int id = nodeId(context, item);
         boolean cycle = ancestors.contains(item);
@@ -269,6 +284,14 @@ public class RecipeGraphModule extends XenoModule {
             recordRaw(context, item, required);
             if (emit) appendPlanLeaf(output, id, item, required, depth, "MAX DEPTH");
             context.depthStops++;
+            return;
+        }
+        boolean smartMaterial = isMaterialCandidate(item) && !isForcedBaseRaw(item);
+        if (context.materialDepth > 0 && smartMaterial && expandedMaterials >= context.materialDepth) {
+            registerLeaf(context, item, "MATERIAL DEPTH");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "MATERIAL DEPTH");
+            context.materialDepthStops++;
             return;
         }
         if ("Common".equals(context.leafMode) && shouldStopAtCommonRaw(context, item)) {
@@ -319,9 +342,11 @@ public class RecipeGraphModule extends XenoModule {
 
         Set<Item> nextAncestors = new LinkedHashSet<>(ancestors);
         nextAncestors.add(item);
+        int nextMaterialDepth = expandedMaterials + (smartMaterial ? 1 : 0);
         for (IngredientPlan ingredient : recipePlan.ingredients) {
             long ingredientAmount = safeMultiply(crafts, ingredient.count);
-            expand(context, output, ingredient.item, ingredientAmount, depth + 1, nextAncestors, emit);
+            expand(context, output, ingredient.item, ingredientAmount, depth + 1,
+                nextMaterialDepth, nextAncestors, emit);
         }
     }
 
@@ -371,21 +396,25 @@ public class RecipeGraphModule extends XenoModule {
 
     private boolean isObviousNoise(ExportContext context, Item output, RecipeEntry recipe,
                                    List<IngredientPlan> ingredients) {
-        String id = recipe.id.toLowerCase(Locale.ROOT);
-        String route = (recipe.id + " " + recipe.type + " " + recipe.station).toLowerCase(Locale.ROOT);
-        if (recipe.jeiOnly && (route.contains("ftbquests") || route.contains("ftb quests"))) {
+        String route = routeText(recipe);
+        if (recipe.jeiOnly && isQuestRoute(route)) {
+            return true;
+        }
+        if (route.contains("deconstruction") || route.contains("deconstruct")
+            || route.contains("recycling") || route.contains("recycle")) {
             return true;
         }
         if (ingredients.size() == 1) {
-            if (id.contains("_to_") || id.contains("/to_") || id.contains("transmutation")) {
+            if (route.contains("transmutation")) {
                 return true;
             }
-            if (reverseCyclePenalty(context, output, ingredients) > 0) {
+            if (isPackingConversionRoute(route)
+                || ((route.contains("_to_") || route.contains("/to_"))
+                    && reverseCyclePenalty(context, output, ingredients) > 0)) {
                 return true;
             }
         }
-        return id.contains("deconstruction") || id.contains("deconstruct")
-            || id.contains("recycling") || id.contains("recycle");
+        return false;
     }
 
     private long recipeScore(ExportContext context, Item output, RecipePlan plan) {
@@ -404,6 +433,15 @@ public class RecipeGraphModule extends XenoModule {
         score = safeAdd(score, directCycles * 100_000_000_000L);
         score = safeAdd(score, recipeRoutePenalty(plan.recipe) * 1_000_000L);
         score = safeAdd(score, reverseCyclePenalty(context, output, plan.ingredients) * 100_000L);
+        Set<Item> visiting = new HashSet<>();
+        visiting.add(output);
+        long recursiveCost = 0L;
+        for (IngredientPlan ingredient : plan.ingredients) {
+            long branch = estimateItemComplexity(context, output, ingredient.item,
+                COMPLEXITY_LOOKAHEAD, visiting);
+            recursiveCost = safeAdd(recursiveCost, safeMultiply(ingredient.count, branch));
+        }
+        score = safeAdd(score, safeMultiply(Math.min(5_000_000L, recursiveCost), 10_000L));
         score = safeAdd(score, plan.ingredients.size() * 100L);
         score = safeAdd(score, Math.min(10_000L, ingredientUnits));
         score -= Math.min(99, Math.max(1, plan.result.getCount()));
@@ -411,24 +449,98 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private int recipeRoutePenalty(RecipeEntry recipe) {
-        String id = recipe.id.toLowerCase(Locale.ROOT);
-        String type = recipe.type.toLowerCase(Locale.ROOT);
+        String route = routeText(recipe);
         int penalty = 0;
-        if (id.contains("deconstruction") || id.contains("deconstruct")) penalty += 2_000;
-        if (id.contains("recycling") || id.contains("recycle")) penalty += 1_800;
-        if (id.contains("uncompress") || id.contains("unpack") || id.contains("from_storage")) penalty += 1_000;
-        if (id.contains("from_block") || id.contains("block_to_")) penalty += 700;
-        if (id.contains("nugget_from_blasting") || id.contains("nugget_from_smelting")) penalty += 1_200;
-        if (id.contains("pebble_to") || id.contains("cobble_to_pebble")) penalty += 600;
-        if (type.contains("stonecut") || id.contains("stonecutting")) penalty += 700;
-        if (id.contains("stairs") || id.contains("slab") || id.contains("wall")) penalty += 350;
+        if (isQuestRoute(route)) penalty += 100_000;
+        if (isAcquisitionRoute(route)) penalty += 25_000;
+        if (route.contains("deconstruction") || route.contains("deconstruct")) penalty += 8_000;
+        if (route.contains("recycling") || route.contains("recycle")) penalty += 7_000;
+        if (isPackingConversionRoute(route)) penalty += 4_000;
+        if (route.contains("transmutation")) penalty += 3_500;
+        if (route.contains("nugget_from_blasting") || route.contains("nugget_from_smelting")) penalty += 4_500;
+        if (route.contains("pebble_to") || route.contains("cobble_to_pebble")) penalty += 2_000;
+        if (route.contains("stonecut") || route.contains("stonecutting")) penalty += 900;
+        if (route.contains("stairs") || route.contains("slab") || route.contains("wall")) penalty += 500;
         return penalty;
+    }
+
+    private String routeText(RecipeEntry recipe) {
+        return (recipe.id + " " + recipe.type + " " + recipe.station).toLowerCase(Locale.ROOT);
+    }
+
+    private boolean isQuestRoute(String route) {
+        return route.contains("ftbquests") || route.contains("ftb quests")
+            || route.contains("quest_reward") || route.contains("quest reward");
+    }
+
+    private boolean isAcquisitionRoute(String route) {
+        return route.contains("hostilenetworks_loot_fabricator")
+            || route.contains("hostilenetworks_sim_chamber")
+            || route.contains("loot_fabricator")
+            || route.contains("loot table") || route.contains("loot_table")
+            || route.contains("mob drop") || route.contains("mob_drop")
+            || route.contains("entity drop") || route.contains("entity_drop")
+            || route.contains("trading") || route.contains("merchant");
+    }
+
+    private boolean isPackingConversionRoute(String route) {
+        return route.contains("uncompress") || route.contains("unpack")
+            || route.contains("from_storage") || route.contains("from_block")
+            || route.contains("block_to_") || route.contains("from_nugget")
+            || route.contains("nugget_to_") || route.contains("storage_block");
+    }
+
+    private long estimateItemComplexity(ExportContext context, Item root, Item item, int remaining,
+                                        Set<Item> visiting) {
+        if (isForcedBaseRaw(item)) {
+            return 1L;
+        }
+        if (remaining <= 0) {
+            return 100L;
+        }
+        if (visiting.contains(item)) {
+            return 1_000_000L;
+        }
+        ComplexityKey key = new ComplexityKey(root, item, remaining);
+        Long cached = context.complexityCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        List<RecipeEntry> recipes = context.recipesByOutput.getOrDefault(item, List.of());
+        if (recipes.isEmpty()) {
+            context.complexityCache.put(key, 20L);
+            return 20L;
+        }
+
+        visiting.add(item);
+        long best = Long.MAX_VALUE;
+        try {
+            for (RecipeEntry recipe : recipes) {
+                List<IngredientPlan> ingredients = planIngredients(context, recipe, visiting, item);
+                if (ingredients.isEmpty() || (context.noiseFilter && isObviousNoise(context, item, recipe, ingredients))) {
+                    continue;
+                }
+                long cost = safeAdd(10L, safeMultiply(recipeRoutePenalty(recipe), 1_000L));
+                for (IngredientPlan ingredient : ingredients) {
+                    long child = estimateItemComplexity(context, root, ingredient.item, remaining - 1, visiting);
+                    cost = safeAdd(cost, safeMultiply(ingredient.count, child));
+                }
+                cost = ceilDiv(cost, Math.max(1, recipe.result.getCount()));
+                best = Math.min(best, cost);
+            }
+        } finally {
+            visiting.remove(item);
+        }
+        long result = best == Long.MAX_VALUE ? 50L : Math.min(5_000_000L, best);
+        context.complexityCache.put(key, result);
+        return result;
     }
 
     private int reverseCyclePenalty(ExportContext context, Item output, List<IngredientPlan> ingredients) {
         int penalty = 0;
         for (IngredientPlan ingredient : ingredients) {
-            if (isCommonRaw(ingredient.item)) {
+            if (isForcedBaseRaw(ingredient.item)) {
                 continue;
             }
             for (RecipeEntry reverse : context.recipesByOutput.getOrDefault(ingredient.item, List.of())) {
@@ -496,7 +608,11 @@ public class RecipeGraphModule extends XenoModule {
         int score = blocked.contains(candidate) ? 100_000 : 0;
         String path = id.getPath().toLowerCase(Locale.ROOT);
         ResourceLocation outputId = itemKey(output);
-        if (isCommonRaw(candidate)) score -= 400;
+        if (isForcedBaseRaw(candidate)) {
+            score -= 400;
+        } else if (isCommonRaw(candidate)) {
+            score -= 40;
+        }
         if ("minecraft".equals(id.getNamespace())) score -= 140;
         if (outputId != null && outputId.getNamespace().equals(id.getNamespace())) score -= 60;
         if (!context.recipesByOutput.containsKey(candidate)) score -= 20;
@@ -683,6 +799,7 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Common raw stops: ").append(context.commonStops).append(System.lineSeparator());
         output.append("No recipe stops: ").append(context.noRecipeStops).append(System.lineSeparator());
         output.append("Maximum depth stops: ").append(context.depthStops).append(System.lineSeparator());
+        output.append("Material depth stops: ").append(context.materialDepthStops).append(System.lineSeparator());
         output.append("Cycle stops: ").append(context.cycleStops).append(System.lineSeparator());
         output.append("Unsupported/empty stops: ").append(context.unsupportedStops).append(System.lineSeparator());
         output.append("Node limit stops: ").append(context.nodeLimitStops).append(System.lineSeparator());
@@ -752,51 +869,87 @@ public class RecipeGraphModule extends XenoModule {
         String path = id.getPath().toLowerCase(Locale.ROOT);
         return COMMON_RAW_NAMES.contains(path)
             || path.endsWith("_ingot")
+            || path.startsWith("ingot_")
             || path.endsWith("_gem")
+            || path.startsWith("gem_")
             || path.endsWith("_dust")
+            || path.startsWith("dust_")
             || path.endsWith("_ore")
             || path.startsWith("raw_")
             || path.endsWith("_raw_material");
     }
 
     private boolean shouldStopAtCommonRaw(ExportContext context, Item item) {
-        if (!isCommonRaw(item)) {
+        if (isForcedBaseRaw(item)) {
+            return true;
+        }
+        if (!isMaterialCandidate(item)) {
             return false;
         }
+        return !hasTrustedManufacturingRecipe(context, item);
+    }
+
+    private boolean isForcedBaseRaw(Item item) {
         ResourceLocation id = itemKey(item);
         if (id == null) {
-            return true;
+            return false;
         }
         String path = id.getPath().toLowerCase(Locale.ROOT);
         if (COMMON_RAW_NAMES.contains(path) || path.endsWith("_ore") || path.startsWith("raw_")
             || path.endsWith("_raw_material")) {
             return true;
         }
-        return !hasCompoundRecipe(context, item);
+        String stem = materialStem(path);
+        return stem != null && BASE_ELEMENT_NAMES.contains(stem);
     }
 
-    private boolean hasCompoundRecipe(ExportContext context, Item item) {
+    private boolean isMaterialCandidate(Item item) {
+        ResourceLocation id = itemKey(item);
+        if (id == null) {
+            return false;
+        }
+        String path = id.getPath().toLowerCase(Locale.ROOT);
+        return isCommonRaw(item) || path.contains("alloy") || path.endsWith("_steel")
+            || path.endsWith("_metal") || path.endsWith("_plate");
+    }
+
+    private String materialStem(String path) {
+        String[] prefixes = {"ingot_", "dust_", "gem_"};
+        for (String prefix : prefixes) {
+            if (path.startsWith(prefix) && path.length() > prefix.length()) {
+                return path.substring(prefix.length());
+            }
+        }
+        String[] suffixes = {"_ingot", "_dust", "_gem"};
+        for (String suffix : suffixes) {
+            if (path.endsWith(suffix) && path.length() > suffix.length()) {
+                return path.substring(0, path.length() - suffix.length());
+            }
+        }
+        return null;
+    }
+
+    private boolean hasTrustedManufacturingRecipe(ExportContext context, Item item) {
         for (RecipeEntry recipe : context.recipesByOutput.getOrDefault(item, List.of())) {
-            String route = (recipe.id + " " + recipe.type + " " + recipe.station).toLowerCase(Locale.ROOT);
-            if (route.contains("ftbquests") || route.contains("ftb quests")
-                || route.contains("deconstruct") || route.contains("recycl")) {
+            String route = routeText(recipe);
+            if (isQuestRoute(route) || isAcquisitionRoute(route) || isPackingConversionRoute(route)
+                || route.contains("deconstruct") || route.contains("recycl")
+                || route.contains("transmutation")) {
                 continue;
             }
-            Set<String> ingredientKinds = new HashSet<>();
+            boolean hasDifferentInput = false;
             for (List<ItemStack> group : recipe.inputGroups) {
-                List<String> options = new ArrayList<>();
                 for (ItemStack stack : group) {
-                    ResourceLocation optionId = itemKey(stack.getItem());
-                    if (optionId != null) {
-                        options.add(optionId.toString());
+                    if (stack != null && !stack.isEmpty() && stack.getItem() != item) {
+                        hasDifferentInput = true;
+                        break;
                     }
                 }
-                options.sort(String::compareTo);
-                if (!options.isEmpty()) {
-                    ingredientKinds.add(String.join("|", options));
+                if (hasDifferentInput) {
+                    break;
                 }
             }
-            if (ingredientKinds.size() >= 2) {
+            if (hasDifferentInput) {
                 return true;
             }
         }
@@ -966,6 +1119,7 @@ public class RecipeGraphModule extends XenoModule {
             + " amount=" + amount.displayValue()
             + " leaf=" + leafMode.choiceValue()
             + " depth=" + maxDepth.displayValue()
+            + " materialDepth=" + (materialDepth.intValue() == 0 ? "Auto" : materialDepth.displayValue())
             + " detail=" + detail.choiceValue()
             + " alternatives=" + alternatives.choiceValue()
             + " noiseFilter=" + noiseFilter.boolValue();
@@ -983,6 +1137,9 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private record RecipeDefinition(Item item, RecipePlan plan, String leafReason, int alternativeCount) {
+    }
+
+    private record ComplexityKey(Item root, Item item, int remaining) {
     }
 
     private static final class MutableIngredientPlan {
@@ -1006,12 +1163,14 @@ public class RecipeGraphModule extends XenoModule {
         private final String detailMode;
         private final String alternativesMode;
         private final boolean noiseFilter;
+        private final int materialDepth;
         private final JeiRecipeBridge.ScanResult jeiScan;
         private final Map<Item, Long> rawTotals = new HashMap<>();
         private final Map<Item, Long> cycleTotals = new HashMap<>();
         private final Map<Item, Integer> nodeIds = new LinkedHashMap<>();
         private final Map<Item, RecipeDefinition> definitions = new LinkedHashMap<>();
         private final Map<Item, RecipePlan> selectedPlans = new HashMap<>();
+        private final Map<ComplexityKey, Long> complexityCache = new HashMap<>();
         private final Set<Item> renderedItems = new HashSet<>();
         private final Set<Item> reportedAlternativeItems = new HashSet<>();
         private final Set<Item> noiseFilteredOutputs = new HashSet<>();
@@ -1024,6 +1183,7 @@ public class RecipeGraphModule extends XenoModule {
         private int commonStops;
         private int noRecipeStops;
         private int depthStops;
+        private int materialDepthStops;
         private int cycleStops;
         private int unsupportedStops;
         private int nodeLimitStops;
@@ -1033,7 +1193,7 @@ public class RecipeGraphModule extends XenoModule {
         private ExportContext(Minecraft client, Map<Item, List<RecipeEntry>> recipesByOutput, int recipeCount,
                               List<String> indexingErrors, int maxDepth, String leafMode,
                               String detailMode, String alternativesMode, boolean noiseFilter,
-                              JeiRecipeBridge.ScanResult jeiScan) {
+                              int materialDepth, JeiRecipeBridge.ScanResult jeiScan) {
             this.client = client;
             this.recipesByOutput = recipesByOutput;
             this.recipeCount = recipeCount;
@@ -1043,6 +1203,7 @@ public class RecipeGraphModule extends XenoModule {
             this.detailMode = detailMode;
             this.alternativesMode = alternativesMode;
             this.noiseFilter = noiseFilter;
+            this.materialDepth = materialDepth;
             this.jeiScan = jeiScan;
         }
     }
