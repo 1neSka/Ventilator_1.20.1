@@ -9,8 +9,10 @@ import java.nio.file.StandardOpenOption;
 import java.security.CodeSource;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -37,7 +39,7 @@ import team.xenobyte.modern.module.setting.ModuleSetting;
 
 public class RecipeGraphModule extends XenoModule {
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
-    private static final int MAX_GRAPH_NODES = 8_000;
+    private static final int MAX_GRAPH_NODES = 100_000;
     private static final int MAX_ALTERNATIVES_PER_INGREDIENT = 12;
     private static final int MAX_RECIPE_ALTERNATIVES = 24;
     private static final int COMPLEXITY_LOOKAHEAD = 3;
@@ -52,6 +54,18 @@ public class RecipeGraphModule extends XenoModule {
         "uranium", "zinc", "aluminum", "aluminium", "platinum", "iridium", "cobalt",
         "tungsten", "titanium", "chromium", "chrome", "magnesium", "lithium",
         "boron", "thorium"
+    );
+    private static final Map<Integer, ManaMaterial> MANA_MATERIALS = Map.ofEntries(
+        Map.entry(2146, new ManaMaterial("terrasteel_ingot", 1_000_000L)),
+        Map.entry(4082, new ManaMaterial("alfsteel_ingot", 1_000_000L)),
+        Map.entry(8058, new ManaMaterial("malachite_ingot", 750_000L)),
+        Map.entry(8060, new ManaMaterial("saffron_ingot", 1_000_000L)),
+        Map.entry(8062, new ManaMaterial("shadow_ingot", 1_500_000L)),
+        Map.entry(8064, new ManaMaterial("crimson_ingot", 2_000_000L)),
+        Map.entry(6613, new ManaMaterial("heroic_manasteel", 3_000_000L)),
+        Map.entry(6614, new ManaMaterial("heroic_elementium", 3_000_000L)),
+        Map.entry(6615, new ManaMaterial("heroic_alfsteel", 3_000_000L)),
+        Map.entry(6617, new ManaMaterial("heroic_alloy", 4_000_000L))
     );
 
     private final ModuleSetting itemId = setting("ItemId", ModuleSetting.number("ItemId", 0.0D, 0.0D, 250000.0D, 1.0D)
@@ -97,7 +111,8 @@ public class RecipeGraphModule extends XenoModule {
             ResourceLocation targetId = itemKey(target);
 
             StringBuilder plan = new StringBuilder(32_000);
-            expand(context, plan, target, requested, 0, 0, new LinkedHashSet<>(), true);
+            expandPlan(context, plan, target, requested, 0, 0, new LinkedHashSet<>(), null);
+            calculateTotals(context, target, requested);
 
             StringBuilder output = new StringBuilder(48_000);
             appendHeader(output, client, context, target, requested);
@@ -256,55 +271,57 @@ public class RecipeGraphModule extends XenoModule {
             .append(System.lineSeparator());
         output.append("- Recipes exposed only through JEI are merged with synchronized RecipeManager recipes.")
             .append(System.lineSeparator());
+        output.append("- Known mana materials are charged at every expanded stage and reported separately.")
+            .append(System.lineSeparator());
     }
 
-    private void expand(ExportContext context, StringBuilder output, Item item, long required, int depth,
-                        int expandedMaterials, Set<Item> ancestors, boolean emit) {
+    private void expandPlan(ExportContext context, StringBuilder output, Item item, long required, int depth,
+                            int expandedMaterials, Set<Item> ancestors, Item parent) {
         context.nodes++;
         int id = nodeId(context, item);
         boolean cycle = ancestors.contains(item);
-        boolean repeated = emit && context.renderedItems.contains(item);
+        if (cycle && parent != null) {
+            context.cycleEdges.add(new RecipeEdge(parent, item));
+        }
+        boolean repeated = context.renderedItems.contains(item);
         if (repeated) {
             appendPlanReference(output, id, item, required, depth, cycle);
             context.collapsedReferences++;
-            emit = false;
-        } else if (emit) {
-            context.renderedItems.add(item);
+            if (cycle) {
+                context.cycleStops++;
+            }
+            return;
         }
+        context.renderedItems.add(item);
 
         if (context.nodes > MAX_GRAPH_NODES) {
             registerLeaf(context, item, "NODE LIMIT");
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "NODE LIMIT");
+            appendPlanLeaf(output, id, item, required, depth, "NODE LIMIT");
             context.nodeLimitStops++;
             return;
         }
         if (depth >= context.maxDepth) {
             registerLeaf(context, item, "MAX DEPTH");
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "MAX DEPTH");
+            appendPlanLeaf(output, id, item, required, depth, "MAX DEPTH");
             context.depthStops++;
             return;
         }
         boolean smartMaterial = isMaterialCandidate(item) && !isForcedBaseRaw(item);
         if (context.materialDepth > 0 && smartMaterial && expandedMaterials >= context.materialDepth) {
             registerLeaf(context, item, "MATERIAL DEPTH");
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "MATERIAL DEPTH");
+            appendPlanLeaf(output, id, item, required, depth, "MATERIAL DEPTH");
             context.materialDepthStops++;
             return;
         }
         if ("Common".equals(context.leafMode) && shouldStopAtCommonRaw(context, item)) {
             registerLeaf(context, item, "COMMON RAW");
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "COMMON RAW");
+            appendPlanLeaf(output, id, item, required, depth, "COMMON RAW");
             context.commonStops++;
             return;
         }
         if (cycle) {
             registerLeaf(context, item, "CYCLE");
-            context.cycleTotals.merge(item, required, RecipeGraphModule::safeAdd);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "CYCLE");
+            appendPlanLeaf(output, id, item, required, depth, "CYCLE");
             context.cycleStops++;
             return;
         }
@@ -312,8 +329,7 @@ public class RecipeGraphModule extends XenoModule {
         List<RecipeEntry> recipes = context.recipesByOutput.getOrDefault(item, List.of());
         if (recipes.isEmpty()) {
             registerLeaf(context, item, "NO RECIPE");
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, "NO RECIPE");
+            appendPlanLeaf(output, id, item, required, depth, "NO RECIPE");
             context.noRecipeStops++;
             return;
         }
@@ -323,8 +339,7 @@ public class RecipeGraphModule extends XenoModule {
             String reason = context.noiseFilteredOutputs.contains(item)
                 ? "FILTERED CONVERSION" : "UNSUPPORTED/EMPTY RECIPE";
             registerLeaf(context, item, reason);
-            recordRaw(context, item, required);
-            if (emit) appendPlanLeaf(output, id, item, required, depth, reason);
+            appendPlanLeaf(output, id, item, required, depth, reason);
             if (context.noiseFilteredOutputs.contains(item)) {
                 context.filteredStops++;
             } else {
@@ -336,18 +351,116 @@ public class RecipeGraphModule extends XenoModule {
         registerRecipe(context, item, recipePlan, recipes.size() - 1);
         int outputCount = Math.max(1, recipePlan.result.getCount());
         long crafts = ceilDiv(required, outputCount);
-        if (emit) {
-            appendPlanRecipe(output, id, item, required, depth, recipePlan.recipe.station, crafts);
-        }
+        appendPlanRecipe(output, id, item, required, depth, recipePlan.recipe.station, crafts);
 
         Set<Item> nextAncestors = new LinkedHashSet<>(ancestors);
         nextAncestors.add(item);
         int nextMaterialDepth = expandedMaterials + (smartMaterial ? 1 : 0);
         for (IngredientPlan ingredient : recipePlan.ingredients) {
             long ingredientAmount = safeMultiply(crafts, ingredient.count);
-            expand(context, output, ingredient.item, ingredientAmount, depth + 1,
-                nextMaterialDepth, nextAncestors, emit);
+            expandPlan(context, output, ingredient.item, ingredientAmount, depth + 1,
+                nextMaterialDepth, nextAncestors, item);
         }
+    }
+
+    private void calculateTotals(ExportContext context, Item target, long requested) {
+        Deque<CalculationState> queue = new ArrayDeque<>();
+        Set<CalculationState> queued = new HashSet<>();
+        Map<CalculationState, Long> demand = new HashMap<>();
+        Map<CalculationState, Long> processedRequired = new HashMap<>();
+        Map<CalculationState, Long> processedCrafts = new HashMap<>();
+
+        addDemand(context, queue, queued, demand, new CalculationState(target, 0, 0), requested);
+        while (!queue.isEmpty()) {
+            CalculationState state = queue.removeFirst();
+            queued.remove(state);
+            long totalRequired = demand.getOrDefault(state, 0L);
+            long previousRequired = processedRequired.getOrDefault(state, 0L);
+            if (totalRequired <= previousRequired) {
+                continue;
+            }
+
+            long requiredDelta = totalRequired - previousRequired;
+            processedRequired.put(state, totalRequired);
+            context.calculatedUnits = safeAdd(context.calculatedUnits, requiredDelta);
+            recordMana(context, state.item, requiredDelta);
+
+            if (state.depth >= context.maxDepth) {
+                registerLeaf(context, state.item, "MAX DEPTH");
+                recordRaw(context, state.item, requiredDelta);
+                continue;
+            }
+            boolean smartMaterial = isMaterialCandidate(state.item) && !isForcedBaseRaw(state.item);
+            if (context.materialDepth > 0 && smartMaterial
+                && state.expandedMaterials >= context.materialDepth) {
+                registerLeaf(context, state.item, "MATERIAL DEPTH");
+                recordRaw(context, state.item, requiredDelta);
+                continue;
+            }
+            if ("Common".equals(context.leafMode) && shouldStopAtCommonRaw(context, state.item)) {
+                registerLeaf(context, state.item, "COMMON RAW");
+                recordRaw(context, state.item, requiredDelta);
+                continue;
+            }
+
+            List<RecipeEntry> recipes = context.recipesByOutput.getOrDefault(state.item, List.of());
+            if (recipes.isEmpty()) {
+                registerLeaf(context, state.item, "NO RECIPE");
+                recordRaw(context, state.item, requiredDelta);
+                continue;
+            }
+            RecipePlan recipePlan = selectedPlan(context, state.item, recipes);
+            if (recipePlan == null || recipePlan.result.isEmpty() || recipePlan.ingredients.isEmpty()) {
+                String reason = context.noiseFilteredOutputs.contains(state.item)
+                    ? "FILTERED CONVERSION" : "UNSUPPORTED/EMPTY RECIPE";
+                registerLeaf(context, state.item, reason);
+                recordRaw(context, state.item, requiredDelta);
+                continue;
+            }
+            registerRecipe(context, state.item, recipePlan, recipes.size() - 1);
+
+            long totalCrafts = ceilDiv(totalRequired, Math.max(1, recipePlan.result.getCount()));
+            long previousCraftCount = processedCrafts.getOrDefault(state, 0L);
+            if (totalCrafts <= previousCraftCount) {
+                continue;
+            }
+            long craftDelta = totalCrafts - previousCraftCount;
+            processedCrafts.put(state, totalCrafts);
+            int nextMaterialDepth = state.expandedMaterials + (smartMaterial ? 1 : 0);
+            for (IngredientPlan ingredient : recipePlan.ingredients) {
+                long ingredientAmount = safeMultiply(craftDelta, ingredient.count);
+                if (context.cycleEdges.contains(new RecipeEdge(state.item, ingredient.item))) {
+                    context.cycleTotals.merge(ingredient.item, ingredientAmount, RecipeGraphModule::safeAdd);
+                    continue;
+                }
+                addDemand(context, queue, queued, demand,
+                    new CalculationState(ingredient.item, state.depth + 1, nextMaterialDepth), ingredientAmount);
+            }
+        }
+        context.calculationStates = processedRequired.size();
+    }
+
+    private void addDemand(ExportContext context, Deque<CalculationState> queue, Set<CalculationState> queued,
+                           Map<CalculationState, Long> demand, CalculationState state, long amount) {
+        if (amount <= 0L) {
+            return;
+        }
+        Long previous = demand.put(state, safeAdd(demand.getOrDefault(state, 0L), amount));
+        if (previous != null) {
+            context.aggregatedDemands++;
+        }
+        if (queued.add(state)) {
+            queue.addLast(state);
+        }
+    }
+
+    private void recordMana(ExportContext context, Item item, long amount) {
+        ManaMaterial material = MANA_MATERIALS.get(BuiltInRegistries.ITEM.getId(item));
+        if (material == null || amount <= 0L) {
+            return;
+        }
+        context.manaUnits.merge(item, amount, RecipeGraphModule::safeAdd);
+        context.totalMana = safeAdd(context.totalMana, safeMultiply(amount, material.manaPerItem));
     }
 
     private RecipePlan selectedPlan(ExportContext context, Item item, List<RecipeEntry> recipes) {
@@ -772,6 +885,29 @@ public class RecipeGraphModule extends XenoModule {
                 .forEach(entry -> output.append("- ").append(itemLabel(entry.getKey()))
                     .append(" x").append(entry.getValue()).append(System.lineSeparator()));
         }
+
+        output.append(System.lineSeparator()).append("MANA COST TOTALS").append(System.lineSeparator());
+        output.append("================").append(System.lineSeparator());
+        output.append("Known mana costs are counted at every expanded recipe stage.")
+            .append(System.lineSeparator());
+        if (context.manaUnits.isEmpty()) {
+            output.append("(no configured mana materials used)").append(System.lineSeparator());
+        } else {
+            context.manaUnits.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(Comparator.comparingInt(BuiltInRegistries.ITEM::getId)))
+                .forEach(entry -> {
+                    int numericId = BuiltInRegistries.ITEM.getId(entry.getKey());
+                    ManaMaterial material = MANA_MATERIALS.get(numericId);
+                    long subtotal = safeMultiply(entry.getValue(), material.manaPerItem);
+                    output.append("- ").append(material.name)
+                        .append(" [").append(itemKey(entry.getKey())).append("; numeric=").append(numericId).append(']')
+                        .append(" x").append(entry.getValue())
+                        .append(" @ ").append(formatLong(material.manaPerItem))
+                        .append(" = ").append(formatLong(subtotal)).append(" mana")
+                        .append(System.lineSeparator());
+                });
+        }
+        output.append("TOTAL MANA: ").append(formatLong(context.totalMana)).append(System.lineSeparator());
     }
 
     private void appendAlternatives(StringBuilder output, ExportContext context) {
@@ -793,6 +929,10 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Expanded occurrences: ").append(context.nodes).append(System.lineSeparator());
         output.append("Unique item definitions: ").append(context.definitions.size()).append(System.lineSeparator());
         output.append("Collapsed references: ").append(context.collapsedReferences).append(System.lineSeparator());
+        output.append("Aggregated calculation states: ").append(context.calculationStates)
+            .append(System.lineSeparator());
+        output.append("Merged repeated demands: ").append(context.aggregatedDemands).append(System.lineSeparator());
+        output.append("Calculated item units: ").append(context.calculatedUnits).append(System.lineSeparator());
         output.append("Recipe choices changed by scoring: ").append(context.scoredRecipeChanges).append(System.lineSeparator());
         output.append("Noise-filtered recipes: ").append(context.filteredRecipes).append(System.lineSeparator());
         output.append("Noise-filtered terminal items: ").append(context.filteredStops).append(System.lineSeparator());
@@ -1082,6 +1222,10 @@ public class RecipeGraphModule extends XenoModule {
         return value == null ? "" : value.replace('\r', ' ').replace('\n', ' ').trim();
     }
 
+    private String formatLong(long value) {
+        return String.format(Locale.ROOT, "%,d", value);
+    }
+
     private static long ceilDiv(long value, long divisor) {
         if (value <= 0L) {
             return 0L;
@@ -1142,6 +1286,15 @@ public class RecipeGraphModule extends XenoModule {
     private record ComplexityKey(Item root, Item item, int remaining) {
     }
 
+    private record RecipeEdge(Item from, Item to) {
+    }
+
+    private record CalculationState(Item item, int depth, int expandedMaterials) {
+    }
+
+    private record ManaMaterial(String name, long manaPerItem) {
+    }
+
     private static final class MutableIngredientPlan {
         private final Item item;
         private long count;
@@ -1167,6 +1320,7 @@ public class RecipeGraphModule extends XenoModule {
         private final JeiRecipeBridge.ScanResult jeiScan;
         private final Map<Item, Long> rawTotals = new HashMap<>();
         private final Map<Item, Long> cycleTotals = new HashMap<>();
+        private final Map<Item, Long> manaUnits = new HashMap<>();
         private final Map<Item, Integer> nodeIds = new LinkedHashMap<>();
         private final Map<Item, RecipeDefinition> definitions = new LinkedHashMap<>();
         private final Map<Item, RecipePlan> selectedPlans = new HashMap<>();
@@ -1174,6 +1328,7 @@ public class RecipeGraphModule extends XenoModule {
         private final Set<Item> renderedItems = new HashSet<>();
         private final Set<Item> reportedAlternativeItems = new HashSet<>();
         private final Set<Item> noiseFilteredOutputs = new HashSet<>();
+        private final Set<RecipeEdge> cycleEdges = new HashSet<>();
         private final StringBuilder fullAlternatives = new StringBuilder();
         private int nodes;
         private int collapsedReferences;
@@ -1189,6 +1344,10 @@ public class RecipeGraphModule extends XenoModule {
         private int nodeLimitStops;
         private int ingredientChoices;
         private int alternativeGroups;
+        private int calculationStates;
+        private int aggregatedDemands;
+        private long calculatedUnits;
+        private long totalMana;
 
         private ExportContext(Minecraft client, Map<Item, List<RecipeEntry>> recipesByOutput, int recipeCount,
                               List<String> indexingErrors, int maxDepth, String leafMode,
