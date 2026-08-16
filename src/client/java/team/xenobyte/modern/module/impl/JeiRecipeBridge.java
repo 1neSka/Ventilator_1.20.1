@@ -1,6 +1,7 @@
 package team.xenobyte.modern.module.impl;
 
 import java.lang.reflect.Array;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -32,9 +33,10 @@ final class JeiRecipeBridge {
     private JeiRecipeBridge() {
     }
 
-    static ScanResult scan(Set<String> managedRecipeIds) {
+    static ScanResult scan(Set<String> indexedRecipeIds) {
         List<RecipeData> recipes = new ArrayList<>();
         List<String> errors = new ArrayList<>();
+        List<String> focusedCategories = new ArrayList<>();
         int categories = 0;
         int inspected = 0;
         int skippedVanilla = 0;
@@ -44,7 +46,8 @@ final class JeiRecipeBridge {
         try {
             Object runtime = invokeStaticNoArgs("mezz.jei.common.Internal", "getJeiRuntime");
             if (runtime == null) {
-                return new ScanResult(List.of(), 0, 0, 0, 0, 0, List.of("JEI runtime is not available"));
+                return new ScanResult(List.of(), 0, 0, 0, 0, 0, List.of(),
+                    List.of("JEI runtime is not available"));
             }
             Object recipeManager = invoke(runtime, "getRecipeManager");
             Object focusFactory = invoke(invoke(runtime, "getJeiHelpers"), "getFocusFactory");
@@ -78,12 +81,17 @@ final class JeiRecipeBridge {
                 }
 
                 int recipeIndex = 0;
+                int capturedInCategory = 0;
+                int emptyInCategory = 0;
+                int skippedInCategory = 0;
+                int errorsBeforeCategory = errors.size();
                 for (Object recipe : categoryRecipes) {
                     recipeIndex++;
                     inspected++;
                     if (recipe instanceof Recipe<?> minecraftRecipe
-                        && managedRecipeIds.contains(recipeId(minecraftRecipe))) {
+                        && indexedRecipeIds.contains(recipeId(minecraftRecipe))) {
                         skippedVanilla++;
+                        skippedInCategory++;
                         continue;
                     }
                     try {
@@ -96,6 +104,10 @@ final class JeiRecipeBridge {
                         }
                         List<RecipeData> captured = capture.finish(recipeId, station, categoryUid);
                         recipes.addAll(captured);
+                        capturedInCategory += captured.size();
+                        if (captured.isEmpty()) {
+                            emptyInCategory++;
+                        }
                         nonItemSlots += capture.nonItemSlots;
                         for (RecipeData data : captured) {
                             if (data.partial()) {
@@ -106,15 +118,28 @@ final class JeiRecipeBridge {
                         addError(errors, categoryUid + " recipe " + recipeIndex, error);
                     }
                 }
+                if (isFocusedCategory(categoryUid, category)) {
+                    focusedCategories.add(categoryUid + " [" + category.getClass().getName() + "]"
+                        + " recipes=" + categoryRecipes.size()
+                        + ", captured=" + capturedInCategory
+                        + ", skipped=" + skippedInCategory
+                        + ", empty=" + emptyInCategory
+                        + ", errors=" + Math.max(0, errors.size() - errorsBeforeCategory));
+                }
             }
         } catch (ClassNotFoundException ignored) {
-            return new ScanResult(List.of(), 0, 0, 0, 0, 0, List.of("JEI is not installed"));
+            return new ScanResult(List.of(), 0, 0, 0, 0, 0, List.of(), List.of("JEI is not installed"));
         } catch (ReflectiveOperationException | LinkageError | RuntimeException error) {
             addError(errors, "JEI bridge initialization", error);
         }
 
         return new ScanResult(List.copyOf(recipes), categories, inspected, skippedVanilla,
-            partial, nonItemSlots, List.copyOf(errors));
+            partial, nonItemSlots, List.copyOf(focusedCategories), List.copyOf(errors));
+    }
+
+    private static boolean isFocusedCategory(String categoryUid, Object category) {
+        String value = (categoryUid + " " + category.getClass().getName()).toLowerCase(Locale.ROOT);
+        return value.contains("gemachinery") || value.contains("geteam.gemachinery");
     }
 
     private static String recipeId(Recipe<?> recipe) {
@@ -280,7 +305,7 @@ final class JeiRecipeBridge {
 
     record ScanResult(List<RecipeData> recipes, int categories, int inspectedRecipes,
                       int skippedVanillaRecipes, int partialRecipes, int nonItemSlots,
-                      List<String> errors) {
+                      List<String> focusedCategories, List<String> errors) {
     }
 
     private static final class LayoutCapture {
@@ -358,6 +383,7 @@ final class JeiRecipeBridge {
         private final String role;
         private final List<ItemStack> items = new ArrayList<>();
         private boolean sawIngredient;
+        private int overlayQuantity = 1;
         private Object proxy;
 
         private SlotCapture(String role) {
@@ -382,10 +408,44 @@ final class JeiRecipeBridge {
                     capture(argument, seen, 0);
                 }
             }
+            if (name.equals("setOverlay") && args != null && args.length > 0) {
+                captureGemachineryOverlayQuantity(args[0]);
+            }
             if (method.getReturnType().isInstance(proxy)) {
                 return proxy;
             }
             return defaultValue(method.getReturnType());
+        }
+
+        private void captureGemachineryOverlayQuantity(Object overlay) {
+            if (overlay == null
+                || !overlay.getClass().getName().startsWith("com.geteam.gemachinery.")) {
+                return;
+            }
+            for (Class<?> type = overlay.getClass(); type != null && type != Object.class; type = type.getSuperclass()) {
+                for (Field field : type.getDeclaredFields()) {
+                    if (field.getType() != String.class) {
+                        continue;
+                    }
+                    try {
+                        if (!field.trySetAccessible()) {
+                            continue;
+                        }
+                        Object value = field.get(overlay);
+                        if (value instanceof String text) {
+                            String normalized = text.trim().replace(",", "").replace("_", "");
+                            if (normalized.matches("[0-9]+")) {
+                                long parsed = Long.parseLong(normalized);
+                                if (parsed > 0L && parsed <= 1_000_000L) {
+                                    overlayQuantity = Math.max(overlayQuantity, (int)parsed);
+                                }
+                            }
+                        }
+                    } catch (IllegalAccessException | RuntimeException ignored) {
+                        // A cosmetic overlay that cannot be inspected is irrelevant to item capture.
+                    }
+                }
+            }
         }
 
         private void capture(Object value, IdentityHashMap<Object, Boolean> seen, int depth) {
@@ -448,7 +508,12 @@ final class JeiRecipeBridge {
             Map<ResourceLocation, ItemStack> unique = new LinkedHashMap<>();
             for (ItemStack stack : items) {
                 ResourceLocation id = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem());
-                unique.putIfAbsent(id, stack);
+                ItemStack normalized = stack.copy();
+                normalized.setCount(Math.max(normalized.getCount(), overlayQuantity));
+                ItemStack existing = unique.get(id);
+                if (existing == null || normalized.getCount() > existing.getCount()) {
+                    unique.put(id, normalized);
+                }
             }
             return List.copyOf(unique.values());
         }

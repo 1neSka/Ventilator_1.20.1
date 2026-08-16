@@ -135,13 +135,15 @@ public class RecipeGraphModule extends XenoModule {
 
         for (Recipe<?> recipe : client.level.getRecipeManager().getRecipes()) {
             recipeCount++;
-            managedRecipeIds.add(safeRecipeId(recipe));
             try {
                 RecipeEntry entry = vanillaEntry(client, recipe);
                 if (entry == null) {
                     continue;
                 }
                 addRecipe(recipesByOutput, indexedKeys, entry);
+                if (!entry.inputGroups.isEmpty()) {
+                    managedRecipeIds.add(entry.id);
+                }
             } catch (RuntimeException | LinkageError error) {
                 if (indexingErrors.size() < 64) {
                     indexingErrors.add(safeRecipeId(recipe) + " -> " + error.getClass().getSimpleName()
@@ -269,7 +271,7 @@ public class RecipeGraphModule extends XenoModule {
             context.depthStops++;
             return;
         }
-        if ("Common".equals(context.leafMode) && isCommonRaw(item)) {
+        if ("Common".equals(context.leafMode) && shouldStopAtCommonRaw(context, item)) {
             registerLeaf(context, item, "COMMON RAW");
             recordRaw(context, item, required);
             if (emit) appendPlanLeaf(output, id, item, required, depth, "COMMON RAW");
@@ -278,7 +280,7 @@ public class RecipeGraphModule extends XenoModule {
         }
         if (cycle) {
             registerLeaf(context, item, "CYCLE");
-            recordRaw(context, item, required);
+            context.cycleTotals.merge(item, required, RecipeGraphModule::safeAdd);
             if (emit) appendPlanLeaf(output, id, item, required, depth, "CYCLE");
             context.cycleStops++;
             return;
@@ -370,6 +372,10 @@ public class RecipeGraphModule extends XenoModule {
     private boolean isObviousNoise(ExportContext context, Item output, RecipeEntry recipe,
                                    List<IngredientPlan> ingredients) {
         String id = recipe.id.toLowerCase(Locale.ROOT);
+        String route = (recipe.id + " " + recipe.type + " " + recipe.station).toLowerCase(Locale.ROOT);
+        if (recipe.jeiOnly && (route.contains("ftbquests") || route.contains("ftb quests"))) {
+            return true;
+        }
         if (ingredients.size() == 1) {
             if (id.contains("_to_") || id.contains("/to_") || id.contains("transmutation")) {
                 return true;
@@ -636,12 +642,20 @@ public class RecipeGraphModule extends XenoModule {
         output.append("===============================").append(System.lineSeparator());
         if (context.rawTotals.isEmpty()) {
             output.append("(none)").append(System.lineSeparator());
-            return;
+        } else {
+            context.rawTotals.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(Comparator.comparing(item -> String.valueOf(itemKey(item)))))
+                .forEach(entry -> output.append("- ").append(itemLabel(entry.getKey()))
+                    .append(" x").append(entry.getValue()).append(System.lineSeparator()));
         }
-        context.rawTotals.entrySet().stream()
-            .sorted(Map.Entry.comparingByKey(Comparator.comparing(item -> String.valueOf(itemKey(item)))))
-            .forEach(entry -> output.append("- ").append(itemLabel(entry.getKey()))
-                .append(" x").append(entry.getValue()).append(System.lineSeparator()));
+        if (!context.cycleTotals.isEmpty()) {
+            output.append(System.lineSeparator()).append("UNRESOLVED CYCLE REFERENCES").append(System.lineSeparator());
+            output.append("===========================").append(System.lineSeparator());
+            context.cycleTotals.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(Comparator.comparing(item -> String.valueOf(itemKey(item)))))
+                .forEach(entry -> output.append("- ").append(itemLabel(entry.getKey()))
+                    .append(" x").append(entry.getValue()).append(System.lineSeparator()));
+        }
     }
 
     private void appendAlternatives(StringBuilder output, ExportContext context) {
@@ -681,6 +695,11 @@ public class RecipeGraphModule extends XenoModule {
         output.append("JEI-only recipes indexed: ").append(context.jeiScan.recipes().size()).append(System.lineSeparator());
         output.append("JEI partial recipes: ").append(context.jeiScan.partialRecipes()).append(System.lineSeparator());
         output.append("JEI non-item slots: ").append(context.jeiScan.nonItemSlots()).append(System.lineSeparator());
+        output.append("JEI focused category details: ").append(context.jeiScan.focusedCategories().size())
+            .append(System.lineSeparator());
+        for (String category : context.jeiScan.focusedCategories()) {
+            output.append("- ").append(category).append(System.lineSeparator());
+        }
         appendErrors(output, "Recipe indexing errors", context.indexingErrors);
         appendErrors(output, "Recipe expansion errors", context.expansionErrors);
         appendErrors(output, "JEI bridge errors", context.jeiScan.errors());
@@ -738,6 +757,50 @@ public class RecipeGraphModule extends XenoModule {
             || path.endsWith("_ore")
             || path.startsWith("raw_")
             || path.endsWith("_raw_material");
+    }
+
+    private boolean shouldStopAtCommonRaw(ExportContext context, Item item) {
+        if (!isCommonRaw(item)) {
+            return false;
+        }
+        ResourceLocation id = itemKey(item);
+        if (id == null) {
+            return true;
+        }
+        String path = id.getPath().toLowerCase(Locale.ROOT);
+        if (COMMON_RAW_NAMES.contains(path) || path.endsWith("_ore") || path.startsWith("raw_")
+            || path.endsWith("_raw_material")) {
+            return true;
+        }
+        return !hasCompoundRecipe(context, item);
+    }
+
+    private boolean hasCompoundRecipe(ExportContext context, Item item) {
+        for (RecipeEntry recipe : context.recipesByOutput.getOrDefault(item, List.of())) {
+            String route = (recipe.id + " " + recipe.type + " " + recipe.station).toLowerCase(Locale.ROOT);
+            if (route.contains("ftbquests") || route.contains("ftb quests")
+                || route.contains("deconstruct") || route.contains("recycl")) {
+                continue;
+            }
+            Set<String> ingredientKinds = new HashSet<>();
+            for (List<ItemStack> group : recipe.inputGroups) {
+                List<String> options = new ArrayList<>();
+                for (ItemStack stack : group) {
+                    ResourceLocation optionId = itemKey(stack.getItem());
+                    if (optionId != null) {
+                        options.add(optionId.toString());
+                    }
+                }
+                options.sort(String::compareTo);
+                if (!options.isEmpty()) {
+                    ingredientKinds.add(String.join("|", options));
+                }
+            }
+            if (ingredientKinds.size() >= 2) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String stationName(Recipe<?> recipe) {
@@ -945,6 +1008,7 @@ public class RecipeGraphModule extends XenoModule {
         private final boolean noiseFilter;
         private final JeiRecipeBridge.ScanResult jeiScan;
         private final Map<Item, Long> rawTotals = new HashMap<>();
+        private final Map<Item, Long> cycleTotals = new HashMap<>();
         private final Map<Item, Integer> nodeIds = new LinkedHashMap<>();
         private final Map<Item, RecipeDefinition> definitions = new LinkedHashMap<>();
         private final Map<Item, RecipePlan> selectedPlans = new HashMap<>();
