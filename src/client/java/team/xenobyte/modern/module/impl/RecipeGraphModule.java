@@ -55,17 +55,17 @@ public class RecipeGraphModule extends XenoModule {
         "tungsten", "titanium", "chromium", "chrome", "magnesium", "lithium",
         "boron", "thorium"
     );
-    private static final Map<Integer, ManaMaterial> MANA_MATERIALS = Map.ofEntries(
-        Map.entry(2146, new ManaMaterial("terrasteel_ingot", 1_000_000L)),
-        Map.entry(4082, new ManaMaterial("alfsteel_ingot", 1_000_000L)),
-        Map.entry(8058, new ManaMaterial("malachite_ingot", 750_000L)),
-        Map.entry(8060, new ManaMaterial("saffron_ingot", 1_000_000L)),
-        Map.entry(8062, new ManaMaterial("shadow_ingot", 1_500_000L)),
-        Map.entry(8064, new ManaMaterial("crimson_ingot", 2_000_000L)),
-        Map.entry(6613, new ManaMaterial("heroic_manasteel", 3_000_000L)),
-        Map.entry(6614, new ManaMaterial("heroic_elementium", 3_000_000L)),
-        Map.entry(6615, new ManaMaterial("heroic_alfsteel", 3_000_000L)),
-        Map.entry(6617, new ManaMaterial("heroic_alloy", 4_000_000L))
+    private static final Map<String, ManaMaterial> MANA_MATERIALS = Map.ofEntries(
+        Map.entry("botania:terrasteel_ingot", new ManaMaterial("terrasteel_ingot", 1_000_000L)),
+        Map.entry("mythicbotany:alfsteel_ingot", new ManaMaterial("alfsteel_ingot", 1_000_000L)),
+        Map.entry("botanicalextramachinery:malachite_ingot", new ManaMaterial("malachite_ingot", 750_000L)),
+        Map.entry("botanicalextramachinery:saffron_ingot", new ManaMaterial("saffron_ingot", 1_000_000L)),
+        Map.entry("botanicalextramachinery:shadow_ingot", new ManaMaterial("shadow_ingot", 1_500_000L)),
+        Map.entry("botanicalextramachinery:crimson_ingot", new ManaMaterial("crimson_ingot", 2_000_000L)),
+        Map.entry("hardevolution:heroic_manasteel", new ManaMaterial("heroic_manasteel", 3_000_000L)),
+        Map.entry("hardevolution:heroic_elementium", new ManaMaterial("heroic_elementium", 3_000_000L)),
+        Map.entry("hardevolution:heroic_alfsteel", new ManaMaterial("heroic_alfsteel", 3_000_000L)),
+        Map.entry("hardevolution:heroic_alloy", new ManaMaterial("heroic_alloy", 4_000_000L))
     );
 
     private final ModuleSetting itemId = setting("ItemId", ModuleSetting.number("ItemId", 0.0D, 0.0D, 250000.0D, 1.0D)
@@ -455,7 +455,8 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private void recordMana(ExportContext context, Item item, long amount) {
-        ManaMaterial material = MANA_MATERIALS.get(BuiltInRegistries.ITEM.getId(item));
+        ResourceLocation registryId = itemKey(item);
+        ManaMaterial material = registryId == null ? null : MANA_MATERIALS.get(registryId.toString());
         if (material == null || amount <= 0L) {
             return;
         }
@@ -894,10 +895,11 @@ public class RecipeGraphModule extends XenoModule {
             output.append("(no configured mana materials used)").append(System.lineSeparator());
         } else {
             context.manaUnits.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey(Comparator.comparingInt(BuiltInRegistries.ITEM::getId)))
+                .sorted(Map.Entry.comparingByKey(Comparator.comparing(item -> String.valueOf(itemKey(item)))))
                 .forEach(entry -> {
                     int numericId = BuiltInRegistries.ITEM.getId(entry.getKey());
-                    ManaMaterial material = MANA_MATERIALS.get(numericId);
+                    ResourceLocation registryId = itemKey(entry.getKey());
+                    ManaMaterial material = MANA_MATERIALS.get(String.valueOf(registryId));
                     long subtotal = safeMultiply(entry.getValue(), material.manaPerItem);
                     output.append("- ").append(material.name)
                         .append(" [").append(itemKey(entry.getKey())).append("; numeric=").append(numericId).append(']')
