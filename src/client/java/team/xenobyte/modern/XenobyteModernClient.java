@@ -43,6 +43,7 @@ import team.xenobyte.modern.module.impl.NoSlowModule;
 import team.xenobyte.modern.module.impl.OverlayModule;
 import team.xenobyte.modern.module.impl.PanicModule;
 import team.xenobyte.modern.module.impl.RuntimeInfoModule;
+import team.xenobyte.modern.module.impl.RecipeGraphModule;
 import team.xenobyte.modern.module.impl.ScaffoldModule;
 import team.xenobyte.modern.module.impl.SearchItemModule;
 import team.xenobyte.modern.module.impl.SelectZoneModule;
@@ -128,6 +129,7 @@ public class XenobyteModernClient {
             registerModule(new NoFallModule());
             registerModule(new AirJumpsModule());
             registerModule(new RuntimeInfoModule());
+            registerModule(new RecipeGraphModule());
             registerModule(new AutoSpawnModule());
             registerModule(new AutoTotemModule());
             registerModule(new AutoEatModule());
