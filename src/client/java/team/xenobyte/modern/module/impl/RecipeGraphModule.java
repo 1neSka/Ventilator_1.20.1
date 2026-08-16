@@ -52,9 +52,13 @@ public class RecipeGraphModule extends XenoModule {
     private final ModuleSetting amount = setting("Amount", ModuleSetting.number("Amount", 1.0D, 1.0D, 1_000_000.0D, 1.0D)
         .describe("Requested output amount."));
     private final ModuleSetting leafMode = setting("LeafMode", ModuleSetting.choice("LeafMode", 0, "Common", "NoRecipe")
-        .describe("Common stops at ingots, gems, dusts and ores. NoRecipe expands until a cycle, depth limit or missing recipe."));
+        .describe("Common stops at ingots, gems, dusts and ores. NoRecipe expands until a terminal recipe."));
     private final ModuleSetting maxDepth = setting("MaxDepth", ModuleSetting.number("MaxDepth", 16.0D, 1.0D, 48.0D, 1.0D)
         .describe("Maximum recursive recipe depth."));
+    private final ModuleSetting detail = setting("Detail", ModuleSetting.choice("Detail", 0, "Compact", "Full")
+        .describe("Compact keeps one-line definitions. Full includes recipe type, serializer and complete choices."));
+    private final ModuleSetting alternatives = setting("Alternatives", ModuleSetting.choice("Alternatives", 0, "Summary", "Full", "Off")
+        .describe("Summary only reports counts. Full appends every available recipe."));
 
     private Path lastExport;
     private String lastResult = "never";
@@ -81,11 +85,17 @@ public class RecipeGraphModule extends XenoModule {
             long requested = Math.max(1L, Math.round(amount.doubleValue()));
             ResourceLocation targetId = itemKey(target);
 
-            StringBuilder output = new StringBuilder(64_000);
+            StringBuilder plan = new StringBuilder(32_000);
+            expand(context, plan, target, requested, 0, new LinkedHashSet<>(), true);
+
+            StringBuilder output = new StringBuilder(48_000);
             appendHeader(output, client, context, target, requested);
-            output.append(System.lineSeparator()).append("RECIPE TREE").append(System.lineSeparator());
-            output.append("===========").append(System.lineSeparator());
-            expand(context, output, target, requested, 0, new LinkedHashSet<>());
+            output.append(System.lineSeparator()).append("COMPACT RECIPE PLAN").append(System.lineSeparator());
+            output.append("===================").append(System.lineSeparator());
+            output.append("Each [Nxxx] item is expanded once. '->' lines reference an earlier definition.")
+                .append(System.lineSeparator());
+            output.append(plan);
+            appendDefinitions(output, context);
             appendTotals(output, context);
             appendAlternatives(output, context);
             appendDiagnostics(output, context);
@@ -103,9 +113,10 @@ public class RecipeGraphModule extends XenoModule {
                 + ", target=" + targetId
                 + ", amount=" + requested
                 + ", recipes=" + context.recipeCount
-                + ", nodes=" + context.nodes
-                + ", raw=" + context.rawTotals.size()
-                + ", alternatives=" + context.alternativeGroups);
+                + ", occurrences=" + context.nodes
+                + ", unique=" + context.definitions.size()
+                + ", references=" + context.collapsedReferences
+                + ", raw=" + context.rawTotals.size());
         } catch (IOException | RuntimeException error) {
             lastResult = "failed: " + error.getClass().getSimpleName();
             ModuleMessageLog.push("RecipeGraph", lastResult);
@@ -137,12 +148,12 @@ public class RecipeGraphModule extends XenoModule {
         Comparator<Recipe<?>> byId = Comparator.comparing(this::safeRecipeId);
         recipesByOutput.values().forEach(recipes -> recipes.sort(byId));
         return new ExportContext(client, recipesByOutput, recipeCount, indexingErrors,
-            maxDepth.intValue(), leafMode.choiceValue());
+            maxDepth.intValue(), leafMode.choiceValue(), detail.choiceValue(), alternatives.choiceValue());
     }
 
     private void appendHeader(StringBuilder output, Minecraft client, ExportContext context, Item target, long requested) {
         ResourceLocation id = itemKey(target);
-        output.append("XENOBYTE RECIPE GRAPH v1").append(System.lineSeparator());
+        output.append("XENOBYTE RECIPE GRAPH v2").append(System.lineSeparator());
         output.append("Generated: ").append(LocalDateTime.now()).append(System.lineSeparator());
         output.append("Dimension: ").append(client.level.dimension().location()).append(System.lineSeparator());
         output.append("Target: ").append(itemLabel(target)).append(System.lineSeparator());
@@ -151,117 +162,121 @@ public class RecipeGraphModule extends XenoModule {
         output.append("Requested amount: ").append(requested).append(System.lineSeparator());
         output.append("Leaf mode: ").append(context.leafMode).append(System.lineSeparator());
         output.append("Maximum depth: ").append(context.maxDepth).append(System.lineSeparator());
+        output.append("Detail: ").append(context.detailMode).append(System.lineSeparator());
+        output.append("Alternatives: ").append(context.alternativesMode).append(System.lineSeparator());
         output.append("Indexed recipes: ").append(context.recipeCount).append(System.lineSeparator());
         output.append(System.lineSeparator());
         output.append("Selection rules:").append(System.lineSeparator());
-        output.append("- Recipe IDs are sorted for deterministic output.").append(System.lineSeparator());
-        output.append("- A recipe that immediately returns to an ancestor is deprioritized.").append(System.lineSeparator());
-        output.append("- Ingredient/tag alternatives choose the first non-cyclic registry ID.").append(System.lineSeparator());
-        output.append("- Alternative recipes and ingredient choices are listed below the main tree.").append(System.lineSeparator());
-        output.append("- Only recipes exposed by the synchronized Minecraft RecipeManager are available in v1.").append(System.lineSeparator());
+        output.append("- Recipes are scored before their ID is used as a deterministic tie breaker.").append(System.lineSeparator());
+        output.append("- Deconstruction, recycling, decorative conversion and reversible cycles are deprioritized.")
+            .append(System.lineSeparator());
+        output.append("- Ingredient alternatives prefer common raw items, vanilla base items and simple variants.")
+            .append(System.lineSeparator());
+        output.append("- Only recipes exposed by the synchronized Minecraft RecipeManager are available.")
+            .append(System.lineSeparator());
     }
 
-    private void expand(ExportContext context, StringBuilder output, Item item, long required, int depth, Set<Item> ancestors) {
+    private void expand(ExportContext context, StringBuilder output, Item item, long required, int depth,
+                        Set<Item> ancestors, boolean emit) {
         context.nodes++;
-        String indent = "  ".repeat(Math.max(0, depth));
-        output.append(indent).append(depth == 0 ? "" : "- ")
-            .append(itemLabel(item)).append(" x").append(required).append(System.lineSeparator());
+        int id = nodeId(context, item);
+        boolean cycle = ancestors.contains(item);
+        boolean repeated = emit && context.renderedItems.contains(item);
+        if (repeated) {
+            appendPlanReference(output, id, item, required, depth, cycle);
+            context.collapsedReferences++;
+            emit = false;
+        } else if (emit) {
+            context.renderedItems.add(item);
+        }
 
         if (context.nodes > MAX_GRAPH_NODES) {
-            appendLeaf(context, output, item, required, indent, "NODE LIMIT");
+            registerLeaf(context, item, "NODE LIMIT");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "NODE LIMIT");
             context.nodeLimitStops++;
             return;
         }
         if (depth >= context.maxDepth) {
-            appendLeaf(context, output, item, required, indent, "MAX DEPTH");
+            registerLeaf(context, item, "MAX DEPTH");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "MAX DEPTH");
             context.depthStops++;
             return;
         }
         if ("Common".equals(context.leafMode) && isCommonRaw(item)) {
-            appendLeaf(context, output, item, required, indent, "COMMON RAW");
+            registerLeaf(context, item, "COMMON RAW");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "COMMON RAW");
             context.commonStops++;
             return;
         }
-        if (ancestors.contains(item)) {
-            appendLeaf(context, output, item, required, indent, "CYCLE");
+        if (cycle) {
+            registerLeaf(context, item, "CYCLE");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "CYCLE");
             context.cycleStops++;
             return;
         }
 
         List<Recipe<?>> recipes = context.recipesByOutput.getOrDefault(item, List.of());
         if (recipes.isEmpty()) {
-            appendLeaf(context, output, item, required, indent, "NO RECIPE");
+            registerLeaf(context, item, "NO RECIPE");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "NO RECIPE");
             context.noRecipeStops++;
             return;
         }
 
-        RecipePlan plan = selectRecipe(context, item, recipes, ancestors);
-        if (plan == null || plan.result.isEmpty() || plan.ingredients.isEmpty()) {
-            appendLeaf(context, output, item, required, indent, "UNSUPPORTED/EMPTY RECIPE");
+        RecipePlan recipePlan = selectedPlan(context, item, recipes);
+        if (recipePlan == null || recipePlan.result.isEmpty() || recipePlan.ingredients.isEmpty()) {
+            registerLeaf(context, item, "UNSUPPORTED/EMPTY RECIPE");
+            recordRaw(context, item, required);
+            if (emit) appendPlanLeaf(output, id, item, required, depth, "UNSUPPORTED/EMPTY RECIPE");
             context.unsupportedStops++;
             return;
         }
 
-        int outputCount = Math.max(1, plan.result.getCount());
+        registerRecipe(context, item, recipePlan, recipes.size() - 1);
+        int outputCount = Math.max(1, recipePlan.result.getCount());
         long crafts = ceilDiv(required, outputCount);
-        long produced = safeMultiply(crafts, outputCount);
-        long leftovers = Math.max(0L, produced - required);
-        output.append(indent).append("  CREATED IN: \"").append(stationName(plan.recipe)).append("\"")
-            .append(System.lineSeparator());
-        output.append(indent).append("  RECIPE: ").append(safeRecipeId(plan.recipe)).append(System.lineSeparator());
-        output.append(indent).append("  TYPE: ").append(recipeTypeId(plan.recipe))
-            .append(" | SERIALIZER: ").append(recipeSerializerId(plan.recipe)).append(System.lineSeparator());
-        output.append(indent).append("  BATCH: ").append(crafts).append(" craft(s) x ")
-            .append(outputCount).append(" output = ").append(produced);
-        if (leftovers > 0L) {
-            output.append(" (leftover ").append(leftovers).append(')');
-        }
-        output.append(System.lineSeparator());
-        if (recipes.size() > 1) {
-            output.append(indent).append("  ALTERNATIVE RECIPES: ").append(recipes.size() - 1)
-                .append(" (see ALTERNATIVES section)").append(System.lineSeparator());
-            rememberAlternatives(context, item, plan.recipe, recipes);
+        if (emit) {
+            appendPlanRecipe(output, id, item, required, depth, stationName(recipePlan.recipe), crafts);
         }
 
         Set<Item> nextAncestors = new LinkedHashSet<>(ancestors);
         nextAncestors.add(item);
-        for (IngredientPlan ingredient : plan.ingredients) {
+        for (IngredientPlan ingredient : recipePlan.ingredients) {
             long ingredientAmount = safeMultiply(crafts, ingredient.count);
-            if (ingredient.alternatives.size() > 1) {
-                output.append(indent).append("  CHOICE: selected ").append(itemLabel(ingredient.item))
-                    .append(" from ").append(formatItems(ingredient.alternatives, MAX_ALTERNATIVES_PER_INGREDIENT))
-                    .append(System.lineSeparator());
-                context.ingredientChoices++;
-            }
-            expand(context, output, ingredient.item, ingredientAmount, depth + 1, nextAncestors);
+            expand(context, output, ingredient.item, ingredientAmount, depth + 1, nextAncestors, emit);
         }
     }
 
-    private RecipePlan selectRecipe(ExportContext context, Item output, List<Recipe<?>> recipes, Set<Item> ancestors) {
+    private RecipePlan selectedPlan(ExportContext context, Item item, List<Recipe<?>> recipes) {
+        if (context.selectedPlans.containsKey(item)) {
+            return context.selectedPlans.get(item);
+        }
+        RecipePlan selected = selectRecipe(context, item, recipes);
+        context.selectedPlans.put(item, selected);
+        if (selected != null && selected.recipe != recipes.get(0)) {
+            context.scoredRecipeChanges++;
+        }
+        return selected;
+    }
+
+    private RecipePlan selectRecipe(ExportContext context, Item output, List<Recipe<?>> recipes) {
         RecipePlan best = null;
-        int bestUnsupportedPenalty = Integer.MAX_VALUE;
-        int bestCyclePenalty = Integer.MAX_VALUE;
-        Set<Item> blockedIngredients = new LinkedHashSet<>(ancestors);
-        blockedIngredients.add(output);
+        long bestScore = Long.MAX_VALUE;
+        Set<Item> blockedIngredients = Set.of(output);
         for (Recipe<?> recipe : recipes) {
             try {
                 ItemStack result = recipe.getResultItem(context.client.level.registryAccess());
-                List<IngredientPlan> ingredients = planIngredients(recipe, blockedIngredients);
-                int cyclePenalty = 0;
-                for (IngredientPlan ingredient : ingredients) {
-                    if (ingredient.item == output || ancestors.contains(ingredient.item)) {
-                        cyclePenalty++;
-                    }
-                }
-                int unsupportedPenalty = ingredients.isEmpty() ? 1 : 0;
+                List<IngredientPlan> ingredients = planIngredients(context, recipe, blockedIngredients, output);
                 RecipePlan candidate = new RecipePlan(recipe, result.copy(), ingredients);
-                if (best == null || unsupportedPenalty < bestUnsupportedPenalty
-                    || (unsupportedPenalty == bestUnsupportedPenalty && cyclePenalty < bestCyclePenalty)
-                    || (unsupportedPenalty == bestUnsupportedPenalty && cyclePenalty == bestCyclePenalty
-                        && safeRecipeId(recipe).compareTo(safeRecipeId(best.recipe)) < 0)) {
+                long score = recipeScore(context, output, candidate);
+                if (best == null || score < bestScore) {
                     best = candidate;
-                    bestUnsupportedPenalty = unsupportedPenalty;
-                    bestCyclePenalty = cyclePenalty;
+                    bestScore = score;
                 }
             } catch (RuntimeException | LinkageError error) {
                 if (context.expansionErrors.size() < 64) {
@@ -273,32 +288,110 @@ public class RecipeGraphModule extends XenoModule {
         return best;
     }
 
-    private List<IngredientPlan> planIngredients(Recipe<?> recipe, Set<Item> ancestors) {
+    private long recipeScore(ExportContext context, Item output, RecipePlan plan) {
+        if (plan.result.isEmpty()) {
+            return Long.MAX_VALUE / 2L;
+        }
+        long score = plan.ingredients.isEmpty() ? 1_000_000_000_000L : 0L;
+        int directCycles = 0;
+        long ingredientUnits = 0L;
+        for (IngredientPlan ingredient : plan.ingredients) {
+            if (ingredient.item == output) {
+                directCycles++;
+            }
+            ingredientUnits = safeAdd(ingredientUnits, ingredient.count);
+        }
+        score = safeAdd(score, directCycles * 100_000_000_000L);
+        score = safeAdd(score, recipeRoutePenalty(plan.recipe) * 1_000_000L);
+        score = safeAdd(score, reverseCyclePenalty(context, output, plan.ingredients) * 100_000L);
+        score = safeAdd(score, plan.ingredients.size() * 100L);
+        score = safeAdd(score, Math.min(10_000L, ingredientUnits));
+        score -= Math.min(99, Math.max(1, plan.result.getCount()));
+        return score;
+    }
+
+    private int recipeRoutePenalty(Recipe<?> recipe) {
+        String id = safeRecipeId(recipe).toLowerCase(Locale.ROOT);
+        String type = recipeTypeId(recipe).toLowerCase(Locale.ROOT);
+        int penalty = 0;
+        if (id.contains("deconstruction") || id.contains("deconstruct")) penalty += 2_000;
+        if (id.contains("recycling") || id.contains("recycle")) penalty += 1_800;
+        if (id.contains("uncompress") || id.contains("unpack") || id.contains("from_storage")) penalty += 1_000;
+        if (id.contains("from_block") || id.contains("block_to_")) penalty += 700;
+        if (id.contains("nugget_from_blasting") || id.contains("nugget_from_smelting")) penalty += 1_200;
+        if (id.contains("pebble_to") || id.contains("cobble_to_pebble")) penalty += 600;
+        if (type.contains("stonecut") || id.contains("stonecutting")) penalty += 700;
+        if (id.contains("stairs") || id.contains("slab") || id.contains("wall")) penalty += 350;
+        return penalty;
+    }
+
+    private int reverseCyclePenalty(ExportContext context, Item output, List<IngredientPlan> ingredients) {
+        int penalty = 0;
+        for (IngredientPlan ingredient : ingredients) {
+            if (isCommonRaw(ingredient.item)) {
+                continue;
+            }
+            for (Recipe<?> reverse : context.recipesByOutput.getOrDefault(ingredient.item, List.of())) {
+                if (recipeContainsItem(context, reverse, output)) {
+                    penalty++;
+                    break;
+                }
+            }
+        }
+        return penalty;
+    }
+
+    private boolean recipeContainsItem(ExportContext context, Recipe<?> recipe, Item item) {
+        Set<Item> cached = context.recipeInputs.get(recipe);
+        if (cached == null) {
+            cached = new HashSet<>();
+            try {
+                for (Ingredient ingredient : recipe.getIngredients()) {
+                    if (ingredient == null || ingredient.isEmpty()) {
+                        continue;
+                    }
+                    for (ItemStack stack : ingredient.getItems()) {
+                        if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
+                            cached.add(stack.getItem());
+                        }
+                    }
+                }
+            } catch (RuntimeException | LinkageError ignored) {
+                // An unreadable custom recipe is not useful for cycle scoring.
+            }
+            context.recipeInputs.put(recipe, cached);
+        }
+        return cached.contains(item);
+    }
+
+    private List<IngredientPlan> planIngredients(ExportContext context, Recipe<?> recipe, Set<Item> blocked, Item output) {
         Map<Item, MutableIngredientPlan> grouped = new LinkedHashMap<>();
         for (Ingredient ingredient : recipe.getIngredients()) {
             if (ingredient == null || ingredient.isEmpty()) {
                 continue;
             }
-            List<ItemStack> alternatives = new ArrayList<>();
+            List<ItemStack> options = new ArrayList<>();
             for (ItemStack stack : ingredient.getItems()) {
                 if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
-                    alternatives.add(stack.copy());
+                    options.add(stack.copy());
                 }
             }
-            alternatives.sort(Comparator.comparing(stack -> String.valueOf(itemKey(stack.getItem()))));
-            if (alternatives.isEmpty()) {
+            options.sort(Comparator
+                .comparingInt((ItemStack stack) -> ingredientPreference(context, output, stack.getItem(), blocked))
+                .thenComparing(stack -> String.valueOf(itemKey(stack.getItem()))));
+            if (options.isEmpty()) {
                 continue;
             }
 
-            ItemStack selected = alternatives.stream()
-                .filter(stack -> !ancestors.contains(stack.getItem()))
+            ItemStack selected = options.stream()
+                .filter(stack -> !blocked.contains(stack.getItem()))
                 .findFirst()
-                .orElse(alternatives.get(0));
+                .orElse(options.get(0));
             long count = Math.max(1, selected.getCount());
-            MutableIngredientPlan existing = grouped.computeIfAbsent(selected.getItem(), ignored -> new MutableIngredientPlan(selected.getItem()));
+            MutableIngredientPlan existing = grouped.computeIfAbsent(selected.getItem(), MutableIngredientPlan::new);
             existing.count = safeAdd(existing.count, count);
-            for (ItemStack alternative : alternatives) {
-                existing.alternatives.add(alternative.getItem());
+            for (ItemStack option : options) {
+                existing.alternatives.add(option.getItem());
             }
         }
 
@@ -310,24 +403,127 @@ public class RecipeGraphModule extends XenoModule {
         return List.copyOf(plans);
     }
 
-    private void appendLeaf(ExportContext context, StringBuilder output, Item item, long amount, String indent, String reason) {
-        output.append(indent).append("  LEAF: ").append(reason).append(System.lineSeparator());
+    private int ingredientPreference(ExportContext context, Item output, Item candidate, Set<Item> blocked) {
+        ResourceLocation id = itemKey(candidate);
+        if (id == null) {
+            return 10_000;
+        }
+        int score = blocked.contains(candidate) ? 100_000 : 0;
+        String path = id.getPath().toLowerCase(Locale.ROOT);
+        ResourceLocation outputId = itemKey(output);
+        if (isCommonRaw(candidate)) score -= 400;
+        if ("minecraft".equals(id.getNamespace())) score -= 140;
+        if (outputId != null && outputId.getNamespace().equals(id.getNamespace())) score -= 60;
+        if (!context.recipesByOutput.containsKey(candidate)) score -= 20;
+        if (path.equals("glass") || path.equals("stone") || path.equals("cobblestone")) score -= 100;
+        if (path.contains("stained") || path.contains("framed") || path.contains("tiled")) score += 80;
+        if (path.endsWith("_stairs") || path.endsWith("_slab") || path.endsWith("_wall")) score += 120;
+        if (path.endsWith("_block")) score += 20;
+        return score;
+    }
+
+    private void registerRecipe(ExportContext context, Item item, RecipePlan plan, int alternativeCount) {
+        RecipeDefinition existing = context.definitions.get(item);
+        if (existing == null || existing.plan == null) {
+            context.definitions.put(item, new RecipeDefinition(item, plan, null, Math.max(0, alternativeCount)));
+        }
+        if (alternativeCount > 0 && context.reportedAlternativeItems.add(item)) {
+            context.alternativeGroups++;
+            if ("Full".equals(context.alternativesMode)) {
+                appendFullAlternatives(context, item, plan.recipe,
+                    context.recipesByOutput.getOrDefault(item, List.of()));
+            }
+        }
+    }
+
+    private void registerLeaf(ExportContext context, Item item, String reason) {
+        context.definitions.putIfAbsent(item, new RecipeDefinition(item, null, reason, 0));
+    }
+
+    private int nodeId(ExportContext context, Item item) {
+        return context.nodeIds.computeIfAbsent(item, ignored -> context.nodeIds.size() + 1);
+    }
+
+    private void recordRaw(ExportContext context, Item item, long amount) {
         context.rawTotals.merge(item, amount, RecipeGraphModule::safeAdd);
     }
 
-    private void rememberAlternatives(ExportContext context, Item item, Recipe<?> selected, List<Recipe<?>> recipes) {
-        ResourceLocation itemId = itemKey(item);
-        String key = String.valueOf(itemId);
-        if (!context.reportedAlternativeItems.add(key)) {
-            return;
+    private void appendPlanRecipe(StringBuilder output, int id, Item item, long required, int depth,
+                                  String station, long crafts) {
+        output.append("  ".repeat(Math.max(0, depth)))
+            .append(nodeToken(id)).append(' ').append(shortItemLabel(item)).append(" x").append(required)
+            .append(" <- ").append(station).append(" (").append(crafts).append(" craft")
+            .append(crafts == 1L ? ")" : "s)").append(System.lineSeparator());
+    }
+
+    private void appendPlanLeaf(StringBuilder output, int id, Item item, long required, int depth, String reason) {
+        output.append("  ".repeat(Math.max(0, depth)))
+            .append(nodeToken(id)).append(' ').append(shortItemLabel(item)).append(" x").append(required)
+            .append(" [TERMINAL: ").append(reason).append(']').append(System.lineSeparator());
+    }
+
+    private void appendPlanReference(StringBuilder output, int id, Item item, long required, int depth, boolean cycle) {
+        output.append("  ".repeat(Math.max(0, depth))).append("-> ")
+            .append(nodeToken(id)).append(' ').append(shortItemLabel(item)).append(" x").append(required);
+        if (cycle) {
+            output.append(" [CYCLE STOP]");
         }
-        context.alternativeGroups++;
-        context.alternatives.append(System.lineSeparator())
-            .append(itemLabel(item)).append(System.lineSeparator());
+        output.append(System.lineSeparator());
+    }
+
+    private void appendDefinitions(StringBuilder output, ExportContext context) {
+        output.append(System.lineSeparator()).append("UNIQUE RECIPE DEFINITIONS").append(System.lineSeparator());
+        output.append("=========================").append(System.lineSeparator());
+        for (RecipeDefinition definition : context.definitions.values()) {
+            Item item = definition.item;
+            output.append(nodeToken(nodeId(context, item))).append(' ').append(itemLabel(item)).append(System.lineSeparator());
+            if (definition.plan == null) {
+                output.append("  terminal: ").append(definition.leafReason).append(System.lineSeparator());
+                continue;
+            }
+
+            RecipePlan plan = definition.plan;
+            output.append("  via: ").append(stationName(plan.recipe)).append(" | ").append(safeRecipeId(plan.recipe))
+                .append(" | output x").append(Math.max(1, plan.result.getCount())).append(System.lineSeparator());
+            if ("Full".equals(context.detailMode)) {
+                output.append("  type: ").append(recipeTypeId(plan.recipe))
+                    .append(" | serializer: ").append(recipeSerializerId(plan.recipe)).append(System.lineSeparator());
+            }
+            if (plan.ingredients.isEmpty()) {
+                output.append("  inputs: not exposed").append(System.lineSeparator());
+            } else {
+                output.append("  inputs:").append(System.lineSeparator());
+                for (IngredientPlan ingredient : plan.ingredients) {
+                    output.append("    - ").append(nodeToken(nodeId(context, ingredient.item))).append(' ')
+                        .append(shortItemLabel(ingredient.item)).append(" x").append(ingredient.count);
+                    if (ingredient.alternatives.size() > 1) {
+                        output.append(" | choice +").append(ingredient.alternatives.size() - 1).append(" option(s)");
+                        context.ingredientChoices++;
+                    }
+                    output.append(System.lineSeparator());
+                    if ("Full".equals(context.detailMode) && ingredient.alternatives.size() > 1) {
+                        output.append("      selected from ")
+                            .append(formatItems(ingredient.alternatives, MAX_ALTERNATIVES_PER_INGREDIENT))
+                            .append(System.lineSeparator());
+                    }
+                }
+            }
+            if (definition.alternativeCount > 0 && !"Off".equals(context.alternativesMode)) {
+                output.append("  alternatives: ").append(definition.alternativeCount).append(" other recipe(s)");
+                if ("Full".equals(context.alternativesMode)) {
+                    output.append("; see FULL ALTERNATIVE RECIPES");
+                }
+                output.append(System.lineSeparator());
+            }
+        }
+    }
+
+    private void appendFullAlternatives(ExportContext context, Item item, Recipe<?> selected, List<Recipe<?>> recipes) {
+        context.fullAlternatives.append(System.lineSeparator()).append(itemLabel(item)).append(System.lineSeparator());
         int shown = 0;
         for (Recipe<?> recipe : recipes) {
             if (shown++ >= MAX_RECIPE_ALTERNATIVES) {
-                context.alternatives.append("  ... ").append(recipes.size() - MAX_RECIPE_ALTERNATIVES)
+                context.fullAlternatives.append("  ... ").append(recipes.size() - MAX_RECIPE_ALTERNATIVES)
                     .append(" more recipe(s)").append(System.lineSeparator());
                 break;
             }
@@ -337,13 +533,13 @@ public class RecipeGraphModule extends XenoModule {
             } catch (RuntimeException | LinkageError ignored) {
                 result = ItemStack.EMPTY;
             }
-            context.alternatives.append(recipe == selected ? "  * SELECTED " : "  - ")
+            context.fullAlternatives.append(recipe == selected ? "  * SELECTED " : "  - ")
                 .append(safeRecipeId(recipe)).append(System.lineSeparator());
-            context.alternatives.append("      CREATED IN: \"").append(stationName(recipe)).append("\"")
-                .append(" | TYPE: ").append(recipeTypeId(recipe))
-                .append(" | OUTPUT: ").append(result.isEmpty() ? "unknown" : result.getCount())
+            context.fullAlternatives.append("      via: ").append(stationName(recipe))
+                .append(" | type: ").append(recipeTypeId(recipe))
+                .append(" | output: ").append(result.isEmpty() ? "unknown" : result.getCount())
                 .append(System.lineSeparator());
-            context.alternatives.append("      INPUTS: ").append(recipeInputSummary(recipe)).append(System.lineSeparator());
+            context.fullAlternatives.append("      inputs: ").append(recipeInputSummary(recipe)).append(System.lineSeparator());
         }
     }
 
@@ -361,19 +557,25 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private void appendAlternatives(StringBuilder output, ExportContext context) {
-        output.append(System.lineSeparator()).append("ALTERNATIVE RECIPES").append(System.lineSeparator());
-        output.append("===================").append(System.lineSeparator());
-        if (context.alternatives.length() == 0) {
+        if (!"Full".equals(context.alternativesMode)) {
+            return;
+        }
+        output.append(System.lineSeparator()).append("FULL ALTERNATIVE RECIPES").append(System.lineSeparator());
+        output.append("========================").append(System.lineSeparator());
+        if (context.fullAlternatives.length() == 0) {
             output.append("(none)").append(System.lineSeparator());
         } else {
-            output.append(context.alternatives);
+            output.append(context.fullAlternatives);
         }
     }
 
     private void appendDiagnostics(StringBuilder output, ExportContext context) {
         output.append(System.lineSeparator()).append("DIAGNOSTICS").append(System.lineSeparator());
         output.append("===========").append(System.lineSeparator());
-        output.append("Expanded nodes: ").append(context.nodes).append(System.lineSeparator());
+        output.append("Expanded occurrences: ").append(context.nodes).append(System.lineSeparator());
+        output.append("Unique item definitions: ").append(context.definitions.size()).append(System.lineSeparator());
+        output.append("Collapsed references: ").append(context.collapsedReferences).append(System.lineSeparator());
+        output.append("Recipe choices changed by scoring: ").append(context.scoredRecipeChanges).append(System.lineSeparator());
         output.append("Common raw stops: ").append(context.commonStops).append(System.lineSeparator());
         output.append("No recipe stops: ").append(context.noRecipeStops).append(System.lineSeparator());
         output.append("Maximum depth stops: ").append(context.depthStops).append(System.lineSeparator());
@@ -400,16 +602,16 @@ public class RecipeGraphModule extends XenoModule {
                 if (ingredient == null || ingredient.isEmpty()) {
                     continue;
                 }
-                List<Item> alternatives = new ArrayList<>();
+                List<Item> options = new ArrayList<>();
                 int count = 1;
                 for (ItemStack stack : ingredient.getItems()) {
                     if (stack != null && !stack.isEmpty() && stack.getItem() != Items.AIR) {
-                        alternatives.add(stack.getItem());
+                        options.add(stack.getItem());
                         count = Math.max(count, stack.getCount());
                     }
                 }
-                if (!alternatives.isEmpty()) {
-                    inputs.add(formatItems(alternatives, 5) + " x" + count);
+                if (!options.isEmpty()) {
+                    inputs.add(formatItems(options, 5) + " x" + count);
                 }
             }
         } catch (RuntimeException | LinkageError error) {
@@ -497,14 +699,23 @@ public class RecipeGraphModule extends XenoModule {
     }
 
     private String itemLabel(Item item) {
-        ResourceLocation id = itemKey(item);
-        String name;
+        return itemName(item) + " [" + itemKey(item) + "; numeric=" + BuiltInRegistries.ITEM.getId(item) + "]";
+    }
+
+    private String shortItemLabel(Item item) {
+        return itemName(item) + " [" + itemKey(item) + "]";
+    }
+
+    private String itemName(Item item) {
         try {
-            name = clean(new ItemStack(item).getHoverName().getString());
+            return clean(new ItemStack(item).getHoverName().getString());
         } catch (RuntimeException | LinkageError error) {
-            name = "unknown";
+            return "unknown";
         }
-        return name + " [" + id + "; numeric=" + BuiltInRegistries.ITEM.getId(item) + "]";
+    }
+
+    private String nodeToken(int id) {
+        return String.format(Locale.ROOT, "[N%03d]", id);
     }
 
     private ResourceLocation itemKey(Item item) {
@@ -590,7 +801,7 @@ public class RecipeGraphModule extends XenoModule {
 
     @Override
     public String description() {
-        return "Exports a recursive recipe tree, machines, alternatives and terminal material totals next to the injected DLL.";
+        return "Exports a compact deduplicated recipe graph, machine definitions and terminal material totals next to the DLL.";
     }
 
     @Override
@@ -600,13 +811,18 @@ public class RecipeGraphModule extends XenoModule {
             + " itemId=" + itemId.displayValue()
             + " amount=" + amount.displayValue()
             + " leaf=" + leafMode.choiceValue()
-            + " depth=" + maxDepth.displayValue();
+            + " depth=" + maxDepth.displayValue()
+            + " detail=" + detail.choiceValue()
+            + " alternatives=" + alternatives.choiceValue();
     }
 
     private record RecipePlan(Recipe<?> recipe, ItemStack result, List<IngredientPlan> ingredients) {
     }
 
     private record IngredientPlan(Item item, long count, List<Item> alternatives) {
+    }
+
+    private record RecipeDefinition(Item item, RecipePlan plan, String leafReason, int alternativeCount) {
     }
 
     private static final class MutableIngredientPlan {
@@ -627,10 +843,19 @@ public class RecipeGraphModule extends XenoModule {
         private final List<String> expansionErrors = new ArrayList<>();
         private final int maxDepth;
         private final String leafMode;
+        private final String detailMode;
+        private final String alternativesMode;
         private final Map<Item, Long> rawTotals = new HashMap<>();
-        private final Set<String> reportedAlternativeItems = new HashSet<>();
-        private final StringBuilder alternatives = new StringBuilder();
+        private final Map<Item, Integer> nodeIds = new LinkedHashMap<>();
+        private final Map<Item, RecipeDefinition> definitions = new LinkedHashMap<>();
+        private final Map<Item, RecipePlan> selectedPlans = new HashMap<>();
+        private final Map<Recipe<?>, Set<Item>> recipeInputs = new HashMap<>();
+        private final Set<Item> renderedItems = new HashSet<>();
+        private final Set<Item> reportedAlternativeItems = new HashSet<>();
+        private final StringBuilder fullAlternatives = new StringBuilder();
         private int nodes;
+        private int collapsedReferences;
+        private int scoredRecipeChanges;
         private int commonStops;
         private int noRecipeStops;
         private int depthStops;
@@ -641,13 +866,16 @@ public class RecipeGraphModule extends XenoModule {
         private int alternativeGroups;
 
         private ExportContext(Minecraft client, Map<Item, List<Recipe<?>>> recipesByOutput, int recipeCount,
-                              List<String> indexingErrors, int maxDepth, String leafMode) {
+                              List<String> indexingErrors, int maxDepth, String leafMode,
+                              String detailMode, String alternativesMode) {
             this.client = client;
             this.recipesByOutput = recipesByOutput;
             this.recipeCount = recipeCount;
             this.indexingErrors = indexingErrors;
             this.maxDepth = maxDepth;
             this.leafMode = leafMode;
+            this.detailMode = detailMode;
+            this.alternativesMode = alternativesMode;
         }
     }
 }
